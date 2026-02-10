@@ -6,9 +6,11 @@ from tools import universal_file_reader, execute_python_code, speak_out_loud, se
 
 # --- NEW: MEMORY TOOLS ---
 try:
-    from memory_core import save_long_term_memory, recall_long_term_memory
+    from memory_core import save_long_term_memory, recall_long_term_memory, save_agent_memory, recall_agent_memory
     vector_save_tool = FunctionTool(save_long_term_memory)
     vector_recall_tool = FunctionTool(recall_long_term_memory)
+    scoped_save_tool = FunctionTool(save_agent_memory)
+    scoped_recall_tool = FunctionTool(recall_agent_memory)
     memory_tools_available = True
 except Exception as e:
     print(f"⚠️ Memory Core Error (Offline): {e}")
@@ -31,6 +33,15 @@ git_tool = FunctionTool(push_to_github)
 # --- MODEL CONFIGURATION ---
 MODEL_NAME = "gemini-2.0-flash-001"
 
+MEMORY_OPERATING_CONTRACT = """
+MEMORY OPERATING CONTRACT:
+1. You have long-term memory tools. Always check memory context before claiming unknowns.
+2. You are forbidden from saying you have no persistent memory unless tools are offline.
+3. If user states durable facts (preferences, tasks, decisions, constraints), save them immediately.
+4. Always return natural-language output for the user.
+5. If tools are used, end with "Executive Summary" in plain language.
+"""
+
 # ==========================================
 # 1. THE SPECIALISTS
 # ==========================================
@@ -39,19 +50,19 @@ MODEL_NAME = "gemini-2.0-flash-001"
 research_agent = Agent(
     name="Research_Agent",
     model=MODEL_NAME,
-    tools=[search_tool],
+    tools=[search_tool, vector_save_tool, vector_recall_tool, scoped_save_tool, scoped_recall_tool] if memory_tools_available else [search_tool],
     instruction="""
     ROLE: Research Engine.
     TASK: Find facts, dates, numbers.
     OUTPUT: Return the data found.
-    """
+    """ + MEMORY_OPERATING_CONTRACT
 )
 
 # --- DEV AGENT ---
 dev_agent = Agent(
     name="Dev_Agent",
     model=MODEL_NAME,
-    tools=[file_tool, exec_tool, sys_tool, code_tool, vision_tool, git_tool],
+    tools=[file_tool, exec_tool, sys_tool, code_tool, vision_tool, git_tool, vector_save_tool, vector_recall_tool, scoped_save_tool, scoped_recall_tool] if memory_tools_available else [file_tool, exec_tool, sys_tool, code_tool, vision_tool, git_tool],
     instruction="""
     ROLE: Senior Code Architect. You are an expert at security, performance, and refactoring.
     
@@ -70,14 +81,14 @@ dev_agent = Agent(
     CRITICAL: Don't just read code—find flaws. Suggest 'Senior-Level' optimizations automatically.
     
     COURIER PROTOCOL (VISION): If you use 'capture_screen', you MUST output: <<SEND_FILE: victor_os/workspace/screen_capture.png>> to send it back.
-    """
+    """ + MEMORY_OPERATING_CONTRACT
 )
 
 # --- DATA SCIENTIST ---
 data_agent = Agent(
     name="Data_Scientist",
     model=MODEL_NAME,
-    tools=[file_tool, exec_tool],
+    tools=[file_tool, exec_tool, vector_save_tool, vector_recall_tool, scoped_save_tool, scoped_recall_tool] if memory_tools_available else [file_tool, exec_tool],
     instruction="""
     ROLE: Analysis Engine.
     
@@ -90,14 +101,14 @@ data_agent = Agent(
     CRITICAL: If the output is large (e.g., a cleaned dataset), DO NOT output raw text. Instead, save it as a file (e.g., victor_os/workspace/cleaned_data.xlsx) and use the tag <<SEND_FILE: victor_os/workspace/cleaned_data.xlsx>>.
     
     RULE: Save plots to 'victor_os/workspace/chart.png' and use the Courier tag to send it.
-    """
+    """ + MEMORY_OPERATING_CONTRACT
 )
 
 # --- SCRIPT & COMMS AGENT ---
 script_agent = Agent(
     name="Script_Agent",
     model=MODEL_NAME,
-    tools=[voice_tool, email_tool],
+    tools=[voice_tool, email_tool, vector_save_tool, vector_recall_tool, scoped_save_tool, scoped_recall_tool] if memory_tools_available else [voice_tool, email_tool],
     instruction="""
     ROLE: Communications & Voice.
     CAPABILITIES:
@@ -106,15 +117,15 @@ script_agent = Agent(
     3. **WRITE**: Write scripts/content.
     
     CRITICAL: You HAVE the email tool. USE IT.
-    """
+    """ + MEMORY_OPERATING_CONTRACT
 )
 
 # --- ACADEMIC WRITER ---
 academic_agent = Agent(
     name="Academic_Writer",
     model=MODEL_NAME,
-    tools=[search_tool, file_tool],
-    instruction="ROLE: Academic Scholar."
+    tools=[search_tool, file_tool, vector_save_tool, vector_recall_tool, scoped_save_tool, scoped_recall_tool] if memory_tools_available else [search_tool, file_tool],
+    instruction="ROLE: Academic Scholar.\n" + MEMORY_OPERATING_CONTRACT
 )
 
 # ==========================================
@@ -133,6 +144,8 @@ boss_tools = [search_tool, vision_tool]
 if memory_tools_available:
     boss_tools.append(vector_save_tool)
     boss_tools.append(vector_recall_tool)
+    boss_tools.append(scoped_save_tool)
+    boss_tools.append(scoped_recall_tool)
 
 chief_of_staff = Agent(
     name="Chief_of_Staff",

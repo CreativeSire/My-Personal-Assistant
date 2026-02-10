@@ -4,6 +4,7 @@ import sys
 import json
 import re
 import sqlite3
+from typing import Any
 from tendo import singleton
 
 try:
@@ -17,6 +18,7 @@ MEMORY_DB_PATH = os.path.join(BASE_DIR, "memory_store", "victor_memory.db")
 WORKSPACE_DIR = os.path.join(BASE_DIR, "workspace")
 SERVER_DEBUG_PATH = os.path.join(BASE_DIR, "server_debug.txt")
 SERVER_STREAM_DEBUG_PATH = os.path.join(BASE_DIR, "server_debug_stream.txt")
+MEMORY_V3_ENABLED = os.getenv("MEMORY_V3_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _resolve_runtime_path(path_text):
@@ -57,6 +59,9 @@ from agents import (
 )
 from tools import transcribe_audio_file, generate_tts_file
 from monitor import log_activity
+from memory_core import MemoryQueryInput, MemoryRecordInput, recall_memory, save_memory
+from memory_policy import classify_memory_candidate, redact_sensitive
+from sitrep_builder import build_executive_sitrep
 
 
 # --- CONFIGURATION ---
@@ -265,6 +270,179 @@ def _sanitize_history_line(role, text):
             return ""
     return text
 
+
+def _build_session_context(user_id: str, limit: int = 16) -> str:
+    history_context = ""
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT event_data FROM events WHERE session_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit * 2))
+        rows = cursor.fetchall()
+        messages = []
+        for row in rows:
+            try:
+                event_json = row[0]
+                data = json.loads(event_json)
+                if "content" in data and "parts" in data["content"]:
+                    role = data["content"]["role"]
+                    text = ""
+                    for part in data["content"]["parts"]:
+                        if "text" in part:
+                            text += part["text"]
+                    text = _sanitize_history_line(role, text)
+                    if text:
+                        label = "User" if role == "user" else "Victor"
+                        messages.append(f"{label}: {text}")
+            except Exception:
+                continue
+        conn.close()
+        if messages:
+            history_str = "\n".join(reversed(messages[-limit:]))
+            history_context = (
+                "SESSION_CONTEXT:\n"
+                "Use this recent chat history for continuity. If useful facts exist here, do not claim amnesia.\n"
+                f"[HISTORY LOG]\n{history_str}\n"
+            )
+    except Exception as e:
+        print(f"⚠️ Session context failed: {e}")
+    return history_context
+
+
+def _memory_rank(hit: dict[str, Any]) -> tuple[int, float, int]:
+    order = {
+        "constraint": 1,
+        "task": 2,
+        "decision": 3,
+        "preference": 4,
+    }
+    mtype = str(hit.get("memory_type", "other")).lower()
+    return (order.get(mtype, 5), -float(hit.get("similarity", 0.0)), -int(hit.get("priority", 3)))
+
+
+def _format_hits_block(title: str, hits: list[dict[str, Any]]) -> str:
+    if not hits:
+        return f"{title}:\n- No relevant entries.\n"
+    ranked = sorted(hits, key=_memory_rank)
+    lines = []
+    for hit in ranked[:10]:
+        scope = hit.get("scope", "global")
+        mtype = hit.get("memory_type", "other")
+        content = str(hit.get("content_plain", "")).strip()
+        if content:
+            lines.append(f"- [{mtype}/{scope}] {content}")
+    if not lines:
+        lines = ["- No relevant entries."]
+    return f"{title}:\n" + "\n".join(lines) + "\n"
+
+
+def _build_memory_context(query: str) -> dict[str, Any]:
+    global_res = recall_memory(
+        MemoryQueryInput(
+            query=query,
+            scope_filter="global",
+            top_k=10,
+            min_similarity=0.2,
+        )
+    )
+    agent_res = recall_memory(
+        MemoryQueryInput(
+            query=query,
+            scope_filter="agent",
+            agent_filter="Chief_of_Staff",
+            top_k=8,
+            min_similarity=0.2,
+        )
+    )
+    global_hits = global_res.get("results", []) if global_res.get("ok") else []
+    agent_hits = agent_res.get("results", []) if agent_res.get("ok") else []
+    return {"global_hits": global_hits, "agent_hits": agent_hits}
+
+
+def _extract_deadlines(memories: list[dict[str, Any]]) -> list[str]:
+    deadline_re = re.compile(r"\b(\d{4}-\d{2}-\d{2}|due\b.*|deadline\b.*|by\s+\w+\s+\d{1,2})", re.IGNORECASE)
+    deadlines = []
+    for item in memories:
+        text = str(item.get("content_plain", ""))
+        found = deadline_re.findall(text)
+        for part in found:
+            entry = text.strip()
+            if entry and entry not in deadlines:
+                deadlines.append(entry)
+    return deadlines[:6]
+
+
+def _build_sitrep_report(user_id: str, query: str) -> str:
+    memory = _build_memory_context(query)
+    g_hits = memory["global_hits"]
+    a_hits = memory["agent_hits"]
+    all_hits = g_hits + a_hits
+
+    by_type: dict[str, list[str]] = {}
+    for hit in all_hits:
+        mtype = str(hit.get("memory_type", "other")).lower()
+        by_type.setdefault(mtype, [])
+        text = str(hit.get("content_plain", "")).strip()
+        if text and text not in by_type[mtype]:
+            by_type[mtype].append(text)
+
+    mission = by_type.get("constraint", [])[:3] + by_type.get("project_fact", [])[:2]
+    projects = by_type.get("project_fact", [])[:5] + by_type.get("task", [])[:2]
+    decisions = by_type.get("decision", [])[:5]
+    blockers = [x for x in by_type.get("task", []) if re.search(r"\b(block|risk|issue|stuck|pending)\b", x, re.IGNORECASE)][:5]
+    deadlines = _extract_deadlines(all_hits)
+    next_actions = by_type.get("task", [])[:5]
+
+    return build_executive_sitrep(mission, projects, decisions, blockers, deadlines, next_actions)
+
+
+def _save_deterministic_memories(user_text: str, final_answer: str, tool_names: list[str], delegated_agents: list[str]):
+    if not MEMORY_V3_ENABLED:
+        return
+    tool_ctx = {"tool_names": tool_names, "delegated_agents": delegated_agents}
+    candidates = classify_memory_candidate(user_text, final_answer, tool_ctx)
+    for candidate in candidates:
+        redacted_text, sensitive_refs = redact_sensitive(candidate.get("text", ""))
+        record = MemoryRecordInput(
+            text=redacted_text,
+            memory_type=candidate.get("memory_type", "other"),
+            scope=candidate.get("scope", "global"),
+            agent_name=candidate.get("agent_name"),
+            priority=int(candidate.get("priority", 3)),
+            source=candidate.get("source", "telegram"),
+            tags=candidate.get("tags", []),
+            sensitive_refs=sensitive_refs,
+        )
+        result = save_memory(record)
+        with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
+            f.write(
+                "MEMORY_SAVE: "
+                + json.dumps(
+                    {
+                        "status": result.get("status"),
+                        "ok": result.get("ok"),
+                        "id": result.get("id"),
+                        "type": record.memory_type,
+                        "scope": record.scope,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    for agent_name in delegated_agents:
+        handoff = MemoryRecordInput(
+            text=f"Handoff observed: Chief_of_Staff delegated work to {agent_name}.",
+            memory_type="status",
+            scope="agent",
+            agent_name=agent_name,
+            priority=3,
+            source="telegram_handoff",
+            tags=["handoff"],
+        )
+        result = save_memory(handoff)
+        with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"MEMORY_HANDOFF_SAVE: {json.dumps(result, ensure_ascii=False)}\n")
+
 # --- VOICE HANDLER ---
 @bot.message_handler(content_types=['voice'])
 def handle_voice(message):
@@ -372,70 +550,28 @@ def process_message(message, user_text, image_data=None):
 
     try:
         # 1. Prepare Content Object
-        # --- MEMORY INJECTION (RAG) ---
-        # --- NEW: VECTOR VAULT (God Mode) ---
-        try:
-            from memory_core import recall_long_term_memory
-            vault_context = recall_long_term_memory(user_text)
-            print(f"🧠 VAULT RECALL: {len(vault_context)} chars")
-        except Exception as e:
-            print(f"⚠️ Vector Core Error (Offline): {e}")
-            vault_context = "Vector Vault Offline."
+        history_context = _build_session_context(user_id)
+        memory_context = _build_memory_context(user_text)
+        global_block = _format_hits_block("GLOBAL_CONTEXT", memory_context["global_hits"])
+        agent_block = _format_hits_block("AGENT_CONTEXT", memory_context["agent_hits"])
+        print(f"🧠 Memory context loaded: global={len(memory_context['global_hits'])}, agent={len(memory_context['agent_hits'])}")
 
-        history_context = ""
-        try:
-            conn = sqlite3.connect(MEMORY_DB_PATH)
-            cursor = conn.cursor()
-            
-            # Fetch last 20 events (generous window to get context)
-            cursor.execute("SELECT event_data FROM events WHERE session_id=? ORDER BY timestamp DESC LIMIT 30", (user_id,))
-            rows = cursor.fetchall()
-            messages = []
-            
-            for row in rows:
-                try:
-                    event_json = row[0]
-                    data = json.loads(event_json)
-                    
-                    # Extract Dialog Content
-                    if "content" in data and "parts" in data["content"]:
-                        role = data["content"]["role"] # 'user' or 'model'
-                        text = ""
-                        for part in data["content"]["parts"]:
-                            if "text" in part:
-                                text += part["text"]
-                        
-                        text = _sanitize_history_line(role, text)
-                        if text:
-                            label = "User" if role == "user" else "Victor"
-                            messages.append(f"{label}: {text}")
-                            
-                except Exception as json_err:
-                    continue # Skip malformed events
+        sitrep_requested = bool(re.search(r"\b(sitrep|situation report|status report)\b", user_text.lower()))
+        if MEMORY_V3_ENABLED and sitrep_requested:
+            final_answer = _build_sitrep_report(user_id, user_text)
+            send_smart_message(message.chat.id, final_answer, reply_to_id=message)
+            _save_deterministic_memories(user_text, final_answer, [], [])
+            log_activity("Chief_of_Staff", "Sitrep Sent", "Success")
+            return
 
-            if messages:
-                # Reverse to chronological order (we fetched DESC)
-                # Keep prompt compact so system instructions are not diluted.
-                history_str = "\n".join(reversed(messages[-12:]))
-                history_context = f"SYSTEM: Here is the recent conversation history from the database. USE THIS to answer. Do not say you don't remember if it is written here.\n\n[HISTORY LOG]\n{history_str}\n\n"
-                print(f"🧠 RAG INJECTED ({len(messages)} turns)")
-            else:
-                print("🧠 RAG: No history found in DB.")
-            
-            conn.close()
-        except Exception as e:
-            print(f"⚠️ RAG Injection Failed: {e}")
-
-        # Prepend history AND Vault to user text
-        # We combine them: 1. Deep Memory (Vault), 2. Recent History (Context), 3. User Input
-        
-        full_system_block = f"""
-=== 🧠 LONG-TERM MEMORY RETRIEVAL (THE VAULT) ===
-{vault_context}
-=================================================
-
-{history_context}
-"""
+        full_system_block = (
+            "=== MEMORY FABRIC V3 ===\n"
+            f"{global_block}\n"
+            f"{agent_block}\n"
+            f"{history_context}\n"
+            "RULE: Use these contexts. Do not claim lack of memory without checking these blocks.\n"
+            "========================\n\n"
+        )
         full_prompt = full_system_block + "USER: " + user_text
 
         parts = [types.Part(text=full_prompt)]
@@ -456,6 +592,7 @@ def process_message(message, user_text, image_data=None):
         
         final_answer = ""
         tool_names = []
+        delegated_agents = []
         with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
             f.write(f"\n--- EVENT STREAM START ({user_text}) ---\n")
             f.write(f"DEBUG: new_message='{new_message}'\n")
@@ -471,6 +608,9 @@ def process_message(message, user_text, image_data=None):
                 detected_tools = _extract_tool_names_from_node(event)
                 if detected_tools:
                     tool_names.extend(detected_tools)
+                author_name = getattr(event, "author", None)
+                if isinstance(author_name, str) and author_name and author_name != "Chief_of_Staff":
+                    delegated_agents.append(author_name)
 
                 # 2. Extract text across all known/unknown event structures
                 text_chunks = _unique_text_chunks(_extract_text_from_node(event))
@@ -486,6 +626,7 @@ def process_message(message, user_text, image_data=None):
         
         # 4. Final Fallback Logic (The Safety Net)
         unique_tools = _unique_text_chunks(tool_names)
+        delegated_agents = _unique_text_chunks(delegated_agents)
         if not final_answer.strip():
             if unique_tools:
                 # Deterministic status summary when tool-only events occur.
@@ -494,6 +635,8 @@ def process_message(message, user_text, image_data=None):
             else:
                 # If absolutely nothing happened, the model failed to generate.
                 final_answer = "⚠️ I received your input, but I was unable to generate a response. Please check the system logs."
+
+        _save_deterministic_memories(user_text, final_answer, unique_tools, delegated_agents)
 
         if should_speak:
             print("🔊 Generating Voice Response...")
@@ -508,7 +651,6 @@ def process_message(message, user_text, image_data=None):
                 log_activity("Chief_of_Staff", "Text Response Sent (Voice Failed)", "Success")
         else:
             # --- COURIER PROTOCOL (Auto-Upload) ---
-            import re
             file_match = re.search(r"<<SEND_FILE:\s*(.*?)>>", final_answer)
             
             if file_match:
