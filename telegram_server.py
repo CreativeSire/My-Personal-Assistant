@@ -272,49 +272,42 @@ def process_message(message, user_text, image_data=None):
             
         try:
             for event in event_stream:
+                # --- DEBUG LOGGING ---
                 with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
-                    f.write(f"DEBUG_EVENT: {type(event)} | Vars: {vars(event) if hasattr(event, '__dict__') else 'No __dict__'}\n")
+                    f.write(f"EVENT_TYPE: {type(event)}\n")
                 
-                # Track if any tool was called
+                # 1. Capture Tool Calls (Metadata)
                 if hasattr(event, 'tool_calls') and event.tool_calls:
-                    with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
-                        f.write("DEBUG: Tool Call Detected\n")
                     tool_called = True
                     continue
-                if hasattr(event, 'tool_responses') and event.tool_responses:
-                    with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
-                        f.write("DEBUG: Tool Response Detected\n")
-                    continue
                 
-                # Check for strings that look like internal tool logs or JSON dumps
-                content_to_add = ""
-                    
-                # 1. Check for basic .text attribute
+                # 2. Extract Text (The Core Task)
+                chunk_text = ""
+                
+                # Check A: Direct text attribute
                 if hasattr(event, 'text') and event.text:
-                    with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
-                        f.write(f"DEBUG: Found event.text: {event.text[:50]}...\n")
-                    content_to_add = event.text
-                # 2. Check for standard Event.content.parts
-                elif event.content and event.content.parts:
+                    chunk_text = event.text
+                
+                # Check B: Content parts
+                elif hasattr(event, 'content') and event.content and event.content.parts:
                     for part in event.content.parts:
-                        if part.text:
-                            content_to_add += part.text
-                # 3. Check for deep structure candidates (ADK specialists)
+                        if hasattr(part, 'text') and part.text:
+                            chunk_text += part.text
+                            
+                # Check C: Candidates (Deep structure)
                 elif hasattr(event, 'candidates') and event.candidates:
                     for candidate in event.candidates:
-                        if hasattr(candidate, 'content') and candidate.content:
+                        if hasattr(candidate, 'content') and candidate.content and candidate.content.parts:
                             for part in candidate.content.parts:
-                                 if hasattr(part, 'text') and part.text:
-                                    content_to_add += part.text
+                                if hasattr(part, 'text') and part.text:
+                                    chunk_text += part.text
 
-                # Filter out chunks that look like tool execution or internal logs
-                if content_to_add:
-                    # Suppress raw JSON dumps (usually internal tool schemas)
-                    # But ensure we keep standard natural language.
-                    is_json = content_to_add.strip().startswith('{') and content_to_add.strip().endswith('}')
+                # 3. Append to Final Answer
+                if chunk_text:
+                    # WE REMOVED THE JSON FILTER. 
+                    # Trust the model. If it outputs text, it goes to the user.
+                    final_answer += chunk_text
                     
-                    if not is_json:
-                        final_answer += content_to_add
         except Exception as e:
              with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
                 f.write(f"ERROR: Event Loop Failed: {e}\n")
@@ -322,12 +315,14 @@ def process_message(message, user_text, image_data=None):
         # 3. Decision: Text or Voice Reply?
         should_speak = "speak" in user_text.lower() or "say" in user_text.lower()
         
+        # 4. Final Fallback Logic (The Safety Net)
         if not final_answer.strip():
             if tool_called:
-                final_answer = "✅ Processing complete."
+                # If tools ran but no text, assume success.
+                final_answer = "✅ Actions executed successfully."
             else:
-                # Emergency fallback if somehow the stream was truly empty
-                final_answer = "I've processed your request. How else can I assist, CeeJay?"
+                # If absolutely nothing happened, the model failed to generate.
+                final_answer = "⚠️ I received your input, but I was unable to generate a response. Please check the system logs."
 
         if should_speak:
             print("🔊 Generating Voice Response...")
