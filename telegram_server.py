@@ -6,16 +6,42 @@ import re
 import sqlite3
 from tendo import singleton
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEMORY_DB_PATH = os.path.join(BASE_DIR, "memory_store", "victor_memory.db")
+WORKSPACE_DIR = os.path.join(BASE_DIR, "workspace")
+SERVER_DEBUG_PATH = os.path.join(BASE_DIR, "server_debug.txt")
+SERVER_STREAM_DEBUG_PATH = os.path.join(BASE_DIR, "server_debug_stream.txt")
+
+
+def _resolve_runtime_path(path_text):
+    """Resolve legacy relative paths like 'victor_os/workspace/x' to this repo."""
+    if not path_text:
+        return path_text
+    path_text = path_text.strip()
+    normalized = path_text.replace("\\", "/")
+    if normalized.startswith("victor_os/"):
+        suffix = normalized[len("victor_os/"):]
+        return os.path.join(BASE_DIR, suffix.replace("/", os.sep))
+    if os.path.isabs(path_text):
+        return path_text
+    return os.path.join(BASE_DIR, path_text)
+
 # --- SINGLETON LOCK (Prevent Duplicate Instances) ---
 try:
     me = singleton.SingleInstance()
 except singleton.SingleInstanceException:
-    with open("victor_os/server_debug.txt", "a") as f:
+    with open(SERVER_DEBUG_PATH, "a", encoding="utf-8") as f:
         f.write(f"[{os.getpid()}] Singleton lock - exiting.\n")
     sys.exit(0)
 
 # --- STARTUP LOG ---
-with open("victor_os/server_debug.txt", "a") as f:
+with open(SERVER_DEBUG_PATH, "a", encoding="utf-8") as f:
     f.write(f"\n--- SERVER STARTUP [{os.getpid()}] ---\n")
 
 from google.adk import Runner
@@ -38,7 +64,7 @@ BOT_TOKEN = "7770925936:AAFfZs38EmdCsS8BUS5x2LT3kNV6on5AdzY"
 
 print("🔌 Connecting to Telegram...")
 bot = telebot.TeleBot(BOT_TOKEN)
-session_service = SqliteSessionService(db_path="victor_os/memory_store/victor_memory.db")
+session_service = SqliteSessionService(db_path=MEMORY_DB_PATH)
 
 # Initialize Runner
 runner = Runner(
@@ -311,15 +337,14 @@ def handle_document(message):
         log_activity("Telegram User", "Document Received", "Info", f"File: {file_name}")
         
         # 1. Ensure workspace exists
-        workspace_dir = "victor_os/workspace"
-        if not os.path.exists(workspace_dir):
-            os.makedirs(workspace_dir)
+        if not os.path.exists(WORKSPACE_DIR):
+            os.makedirs(WORKSPACE_DIR)
             
         # 2. Download the file
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
-        file_path = os.path.join(workspace_dir, file_name)
+        file_path = os.path.join(WORKSPACE_DIR, file_name)
         with open(file_path, 'wb') as new_file:
             new_file.write(downloaded_file)
             
@@ -359,7 +384,7 @@ def process_message(message, user_text, image_data=None):
 
         history_context = ""
         try:
-            conn = sqlite3.connect("victor_os/memory_store/victor_memory.db")
+            conn = sqlite3.connect(MEMORY_DB_PATH)
             cursor = conn.cursor()
             
             # Fetch last 20 events (generous window to get context)
@@ -431,14 +456,14 @@ def process_message(message, user_text, image_data=None):
         
         final_answer = ""
         tool_names = []
-        with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
+        with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
             f.write(f"\n--- EVENT STREAM START ({user_text}) ---\n")
             f.write(f"DEBUG: new_message='{new_message}'\n")
             
         try:
             for event in event_stream:
                 # --- DEBUG LOGGING ---
-                with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
+                with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
                     f.write(f"EVENT_TYPE: {type(event)}\n")
                     f.write(f"EVENT_REPR: {repr(event)[:2000]}\n")
 
@@ -453,7 +478,7 @@ def process_message(message, user_text, image_data=None):
                     final_answer += "".join(text_chunks)
                     
         except Exception as e:
-             with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
+             with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
                 f.write(f"ERROR: Event Loop Failed: {e}\n")
 
         # 3. Decision: Text or Voice Reply?
@@ -488,19 +513,20 @@ def process_message(message, user_text, image_data=None):
             
             if file_match:
                 raw_path = file_match.group(1).strip()
+                resolved_path = _resolve_runtime_path(raw_path)
                 clean_answer = final_answer.replace(file_match.group(0), "").strip()
                 
                 if clean_answer:
                     send_smart_message(message.chat.id, clean_answer, reply_to_id=message)
                 
-                print(f"📦 COURIER: Shipping {raw_path}...")
-                if os.path.exists(raw_path):
-                    with open(raw_path, 'rb') as doc:
+                print(f"📦 COURIER: Shipping {resolved_path}...")
+                if os.path.exists(resolved_path):
+                    with open(resolved_path, 'rb') as doc:
                         bot.send_document(message.chat.id, doc)
-                    log_activity("Chief_of_Staff", "Courier Successful", "Success", f"File: {raw_path}")
+                    log_activity("Chief_of_Staff", "Courier Successful", "Success", f"File: {resolved_path}")
                 else:
                     send_smart_message(message.chat.id, f"❌ Courier Error: File not found at {raw_path}", reply_to_id=message)
-                    log_activity("Chief_of_Staff", "Courier Failed", "Error", f"Missing: {raw_path}")
+                    log_activity("Chief_of_Staff", "Courier Failed", "Error", f"Missing: {resolved_path}")
             else:
                 send_smart_message(message.chat.id, final_answer, reply_to_id=message)
                 log_activity("Chief_of_Staff", "Text Response Sent", "Success")
