@@ -1,6 +1,9 @@
 import telebot
 import os
 import sys
+import json
+import re
+import sqlite3
 from tendo import singleton
 
 # --- SINGLETON LOCK (Prevent Duplicate Instances) ---
@@ -72,6 +75,169 @@ def send_smart_message(chat_id, text, reply_to_id=None):
         else:
             bot.send_message(chat_id, formatted_chunk)
     return True
+
+
+def _extract_text_from_node(node, seen=None, from_text_field=False):
+    """Recursively extract all text-like fields from mixed event payloads."""
+    if seen is None:
+        seen = set()
+
+    chunks = []
+    node_id = id(node)
+    if node_id in seen:
+        return chunks
+    seen.add(node_id)
+
+    if node is None:
+        return chunks
+
+    if isinstance(node, str):
+        text = node.strip()
+        if from_text_field and text:
+            chunks.append(text)
+        return chunks
+
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_lower = str(key).lower()
+            is_text_key = key_lower in {"text", "output_text", "response_text", "final_text"}
+            chunks.extend(_extract_text_from_node(value, seen, from_text_field=is_text_key))
+        return chunks
+
+    if isinstance(node, (list, tuple, set)):
+        for item in node:
+            chunks.extend(_extract_text_from_node(item, seen, from_text_field=from_text_field))
+        return chunks
+
+    if hasattr(node, "text") and isinstance(getattr(node, "text"), str):
+        text = node.text.strip()
+        if text:
+            chunks.append(text)
+
+    if hasattr(node, "model_dump"):
+        try:
+            dumped = node.model_dump(exclude_none=True)
+            chunks.extend(_extract_text_from_node(dumped, seen, from_text_field=from_text_field))
+            return chunks
+        except Exception:
+            pass
+
+    if hasattr(node, "__dict__"):
+        try:
+            chunks.extend(_extract_text_from_node(vars(node), seen, from_text_field=from_text_field))
+        except Exception:
+            pass
+
+    return chunks
+
+
+def _extract_tool_names_from_node(node, seen=None):
+    """Recursively detect tool/function call names from mixed event payloads."""
+    if seen is None:
+        seen = set()
+
+    names = []
+    node_id = id(node)
+    if node_id in seen:
+        return names
+    seen.add(node_id)
+
+    if node is None:
+        return names
+
+    if isinstance(node, dict):
+        if "tool_calls" in node and isinstance(node["tool_calls"], list):
+            for call in node["tool_calls"]:
+                if isinstance(call, dict):
+                    fn_name = ""
+                    if isinstance(call.get("name"), str):
+                        fn_name = call["name"].strip()
+                    elif isinstance(call.get("function"), dict) and isinstance(call["function"].get("name"), str):
+                        fn_name = call["function"]["name"].strip()
+                    if fn_name:
+                        names.append(fn_name)
+        if "function_call" in node and isinstance(node["function_call"], dict):
+            fn_name = node["function_call"].get("name")
+            if isinstance(fn_name, str) and fn_name.strip():
+                names.append(fn_name.strip())
+        if "function_calls" in node and isinstance(node["function_calls"], list):
+            for call in node["function_calls"]:
+                if isinstance(call, dict):
+                    fn_name = call.get("name")
+                    if isinstance(fn_name, str) and fn_name.strip():
+                        names.append(fn_name.strip())
+
+        for value in node.values():
+            names.extend(_extract_tool_names_from_node(value, seen))
+        return names
+
+    if isinstance(node, (list, tuple, set)):
+        for item in node:
+            names.extend(_extract_tool_names_from_node(item, seen))
+        return names
+
+    if hasattr(node, "tool_calls") and getattr(node, "tool_calls"):
+        tool_calls = getattr(node, "tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                fn_name = getattr(call, "name", None)
+                if isinstance(fn_name, str) and fn_name.strip():
+                    names.append(fn_name.strip())
+                fn_obj = getattr(call, "function", None)
+                fn_obj_name = getattr(fn_obj, "name", None)
+                if isinstance(fn_obj_name, str) and fn_obj_name.strip():
+                    names.append(fn_obj_name.strip())
+
+    if hasattr(node, "function_call") and getattr(node, "function_call"):
+        fn_call = getattr(node, "function_call")
+        fn_name = getattr(fn_call, "name", None)
+        if isinstance(fn_name, str) and fn_name.strip():
+            names.append(fn_name.strip())
+
+    if hasattr(node, "model_dump"):
+        try:
+            dumped = node.model_dump(exclude_none=True)
+            names.extend(_extract_tool_names_from_node(dumped, seen))
+            return names
+        except Exception:
+            pass
+
+    if hasattr(node, "__dict__"):
+        try:
+            names.extend(_extract_tool_names_from_node(vars(node), seen))
+        except Exception:
+            pass
+
+    return names
+
+
+def _unique_text_chunks(chunks):
+    deduped = []
+    seen = set()
+    for chunk in chunks:
+        key = chunk.strip()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(key)
+    return deduped
+
+
+def _sanitize_history_line(role, text):
+    """Drop known persona-breaking assistant outputs from injected memory history."""
+    if role != "model":
+        return text
+
+    lowered = text.lower()
+    blocked = [
+        "i am a large language model",
+        "as an ai",
+        "i do not retain information about our past conversations",
+        "i don't retain information from past conversations",
+    ]
+    for phrase in blocked:
+        if phrase in lowered:
+            return ""
+    return text
 
 # --- VOICE HANDLER ---
 @bot.message_handler(content_types=['voice'])
@@ -182,9 +348,6 @@ def process_message(message, user_text, image_data=None):
     try:
         # 1. Prepare Content Object
         # --- MEMORY INJECTION (RAG) ---
-        import sqlite3
-        import json
-        
         # --- NEW: VECTOR VAULT (God Mode) ---
         try:
             from memory_core import recall_long_term_memory
@@ -200,7 +363,7 @@ def process_message(message, user_text, image_data=None):
             cursor = conn.cursor()
             
             # Fetch last 20 events (generous window to get context)
-            cursor.execute(f"SELECT event_data FROM events WHERE session_id='{user_id}' ORDER BY timestamp DESC LIMIT 20")
+            cursor.execute("SELECT event_data FROM events WHERE session_id=? ORDER BY timestamp DESC LIMIT 30", (user_id,))
             rows = cursor.fetchall()
             messages = []
             
@@ -217,6 +380,7 @@ def process_message(message, user_text, image_data=None):
                             if "text" in part:
                                 text += part["text"]
                         
+                        text = _sanitize_history_line(role, text)
                         if text:
                             label = "User" if role == "user" else "Victor"
                             messages.append(f"{label}: {text}")
@@ -226,7 +390,8 @@ def process_message(message, user_text, image_data=None):
 
             if messages:
                 # Reverse to chronological order (we fetched DESC)
-                history_str = "\n".join(reversed(messages))
+                # Keep prompt compact so system instructions are not diluted.
+                history_str = "\n".join(reversed(messages[-12:]))
                 history_context = f"SYSTEM: Here is the recent conversation history from the database. USE THIS to answer. Do not say you don't remember if it is written here.\n\n[HISTORY LOG]\n{history_str}\n\n"
                 print(f"🧠 RAG INJECTED ({len(messages)} turns)")
             else:
@@ -259,13 +424,13 @@ def process_message(message, user_text, image_data=None):
 
         # 2. Start the Stream
         event_stream = runner.run(
-            user_id="telegram_user", 
+            user_id=user_id,
             session_id=user_id, 
             new_message=new_message
         )
         
         final_answer = ""
-        tool_called = False
+        tool_names = []
         with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
             f.write(f"\n--- EVENT STREAM START ({user_text}) ---\n")
             f.write(f"DEBUG: new_message='{new_message}'\n")
@@ -275,38 +440,17 @@ def process_message(message, user_text, image_data=None):
                 # --- DEBUG LOGGING ---
                 with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
                     f.write(f"EVENT_TYPE: {type(event)}\n")
-                
-                # 1. Capture Tool Calls (Metadata)
-                if hasattr(event, 'tool_calls') and event.tool_calls:
-                    tool_called = True
-                    continue
-                
-                # 2. Extract Text (The Core Task)
-                chunk_text = ""
-                
-                # Check A: Direct text attribute
-                if hasattr(event, 'text') and event.text:
-                    chunk_text = event.text
-                
-                # Check B: Content parts
-                elif hasattr(event, 'content') and event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            chunk_text += part.text
-                            
-                # Check C: Candidates (Deep structure)
-                elif hasattr(event, 'candidates') and event.candidates:
-                    for candidate in event.candidates:
-                        if hasattr(candidate, 'content') and candidate.content and candidate.content.parts:
-                            for part in candidate.content.parts:
-                                if hasattr(part, 'text') and part.text:
-                                    chunk_text += part.text
+                    f.write(f"EVENT_REPR: {repr(event)[:2000]}\n")
 
-                # 3. Append to Final Answer
-                if chunk_text:
-                    # WE REMOVED THE JSON FILTER. 
-                    # Trust the model. If it outputs text, it goes to the user.
-                    final_answer += chunk_text
+                # 1. Capture Tool Calls (Metadata)
+                detected_tools = _extract_tool_names_from_node(event)
+                if detected_tools:
+                    tool_names.extend(detected_tools)
+
+                # 2. Extract text across all known/unknown event structures
+                text_chunks = _unique_text_chunks(_extract_text_from_node(event))
+                if text_chunks:
+                    final_answer += "".join(text_chunks)
                     
         except Exception as e:
              with open("victor_os/server_debug_stream.txt", "a", encoding="utf-8") as f:
@@ -316,10 +460,12 @@ def process_message(message, user_text, image_data=None):
         should_speak = "speak" in user_text.lower() or "say" in user_text.lower()
         
         # 4. Final Fallback Logic (The Safety Net)
+        unique_tools = _unique_text_chunks(tool_names)
         if not final_answer.strip():
-            if tool_called:
-                # If tools ran but no text, assume success.
-                final_answer = "✅ Actions executed successfully."
+            if unique_tools:
+                # Deterministic status summary when tool-only events occur.
+                tool_summary = ", ".join(unique_tools[:3])
+                final_answer = f"Completed your request using: {tool_summary}. If you want, I can provide a concise result summary next."
             else:
                 # If absolutely nothing happened, the model failed to generate.
                 final_answer = "⚠️ I received your input, but I was unable to generate a response. Please check the system logs."

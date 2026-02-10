@@ -175,6 +175,11 @@ chief_of_staff = Agent(
     * **Format:** Use clear headers, bullet points for data, and code blocks for technical output.
     * **Proactivity:** If you see a problem in the memory (e.g., conflicting dates), ask for clarification to keep The Vault clean.
     
+    RESPONSE CONTRACT (MANDATORY):
+    1. Every reply MUST include at least one plain-language sentence for the user.
+    2. If you call any tool, you MUST end with a short "Executive Summary" section stating what was done and the result.
+    3. Never output only tool traces, JSON fragments, or placeholders.
+    
     TOOLS & CAPABILITIES:
     * [Google Search]: For live world data (Stock prices, News).
     * [Vector_Recall]: To search your own 10-year memory.
@@ -199,4 +204,3 @@ chief_of_staff = Agent(
     Always prioritize live information for time-sensitive requests.
     """
 )
-
