@@ -1,3 +1,4 @@
+import collections
 import datetime
 import hashlib
 import json
@@ -6,7 +7,7 @@ import re
 import shutil
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -62,6 +63,8 @@ class ExtractedFields:
     violations: list[str]
     _extractor_model_used: str
     ocr_text_present: bool
+    warning_codes: list[str] = field(default_factory=list)
+    date_candidates: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def delivery_date(self) -> str:
@@ -105,6 +108,8 @@ class JobContext:
     root_dir: str
     input_dir: str
     ok_dir: str
+    ok_confirmed_dir: str
+    ok_warnings_dir: str
     review_dir: str
     failed_dir: str
     evidence_dir: str
@@ -217,7 +222,7 @@ def _normalize_date(value: Any) -> str:
     if not text:
         return ""
 
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%m-%d-%Y"):
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
         try:
             return datetime.datetime.strptime(text, fmt).date().isoformat()
         except Exception:
@@ -230,10 +235,19 @@ def _normalize_date(value: Any) -> str:
         except Exception:
             return ""
 
-    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2})\b", text)
+    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b", text)
     if m:
         try:
-            return datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+            day = int(m.group(1))
+            month = int(m.group(2))
+            year_raw = int(m.group(3))
+            year = year_raw + 2000 if year_raw < 100 else year_raw
+            # Nigeria default: DD/MM/YY unless impossible
+            try:
+                return datetime.date(year, month, day).isoformat()
+            except Exception:
+                # fallback only when DD/MM impossible
+                return datetime.date(year, day, month).isoformat()
         except Exception:
             return ""
 
@@ -382,7 +396,7 @@ def _coerce_schema_fields(raw_fields: dict[str, Any], *, model_used: str, ocr_te
 
 
 def _validate_fields(fields: ExtractedFields) -> ExtractedFields:
-    violations = list(fields.violations or [])
+    violations: list[str] = []
     raw_invoice_input = str((fields.fields or {}).get("invoice_number", "") or "")
     raw_invoice_digits = re.sub(r"\D", "", raw_invoice_input)
     candidate = _coerce_schema_fields(
@@ -439,11 +453,15 @@ def _build_job_context(job_id: str) -> JobContext:
     root_dir = os.path.join(cfg.workspace_dir, "jobs", job_id)
     input_dir = os.path.join(root_dir, "input")
     ok_dir = os.path.join(root_dir, "artifacts", "OK")
+    ok_confirmed_dir = os.path.join(ok_dir, "CONFIRMED")
+    ok_warnings_dir = os.path.join(ok_dir, "WARNINGS")
     review_dir = os.path.join(root_dir, "artifacts", "Review")
     failed_dir = os.path.join(root_dir, "artifacts", "Failed")
     evidence_dir = os.path.join(root_dir, "evidence")
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(ok_dir, exist_ok=True)
+    os.makedirs(ok_confirmed_dir, exist_ok=True)
+    os.makedirs(ok_warnings_dir, exist_ok=True)
     os.makedirs(review_dir, exist_ok=True)
     os.makedirs(failed_dir, exist_ok=True)
     os.makedirs(evidence_dir, exist_ok=True)
@@ -452,6 +470,8 @@ def _build_job_context(job_id: str) -> JobContext:
         root_dir=root_dir,
         input_dir=input_dir,
         ok_dir=ok_dir,
+        ok_confirmed_dir=ok_confirmed_dir,
+        ok_warnings_dir=ok_warnings_dir,
         review_dir=review_dir,
         failed_dir=failed_dir,
         evidence_dir=evidence_dir,
@@ -627,30 +647,30 @@ def _best_preprocessed_image(input_path: str, output_path: str) -> str | None:
         return None
 
 
-def _zone_ocr_retry(image_path: str) -> str:
+def _zone_ocr_retry(image_path: str) -> dict[str, str]:
     if not (Image and pytesseract) or not image_path or not os.path.exists(image_path):
-        return ""
+        return {"top": "", "mid": "", "bottom": ""}
     try:
         img = Image.open(image_path)
     except Exception:
-        return ""
+        return {"top": "", "mid": "", "bottom": ""}
 
     w, h = img.size
-    boxes = [
-        (0, 0, w, int(h * 0.38)),
-        (0, int(h * 0.25), w, int(h * 0.75)),
-        (0, int(h * 0.62), w, h),
-    ]
-    chunks: list[str] = []
-    for box in boxes:
+    boxes = {
+        "top": (0, 0, w, int(h * 0.25)),
+        "mid": (0, int(h * 0.25), w, int(h * 0.62)),
+        "bottom": (0, int(h * 0.60), w, h),
+    }
+    zone_texts: dict[str, str] = {"top": "", "mid": "", "bottom": ""}
+    for zone, box in boxes.items():
         try:
             crop = img.crop(box)
             txt = pytesseract.image_to_string(crop)
             if txt.strip():
-                chunks.append(txt.strip())
+                zone_texts[zone] = txt.strip()
         except Exception:
             continue
-    return "\n".join(chunks).strip()
+    return zone_texts
 
 
 def _first_page_image_for_vision(path: str, evidence_dir: str) -> str | None:
@@ -689,6 +709,114 @@ def _required_rename_issues(fields: ExtractedFields) -> list[str]:
     elif not re.fullmatch(r"\d{6}", inv):
         issues.append("invoice_number_not_6_digits")
     return issues
+
+
+def _standardize_pdf_for_evidence(path: str, evidence_dir: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    out_name = "standardized.pdf"
+    out_path = os.path.join(evidence_dir, out_name)
+    if ext == ".pdf":
+        shutil.copy2(path, out_path)
+    else:
+        _to_pdf_path(path, out_path)
+    return out_path
+
+
+def _extract_date_candidates_from_lines(text: str, region: str = "unknown") -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if not text:
+        return candidates
+
+    keyword_re = re.compile(r"(received|delivery|delivered|stamp|pod|security|sign|approved|recd)", re.IGNORECASE)
+    token_re = re.compile(
+        r"(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b20\d{2}[/-]\d{1,2}[/-]\d{1,2}\b|\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b)",
+        re.IGNORECASE,
+    )
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        has_kw = bool(keyword_re.search(line))
+        for match in token_re.findall(line):
+            iso = _normalize_date(match)
+            if not iso:
+                continue
+            score = 0
+            if has_kw:
+                score += 3
+            if region == "bottom":
+                score += 2
+            elif region == "top":
+                score += 1
+            warnings = []
+            if has_kw:
+                warnings.append("date_best_score_inferred")
+            if region == "bottom":
+                warnings.append("date_from_stamp_region")
+            if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2}", match.strip()):
+                warnings.append("date_ddmmyy_assumed")
+            candidates.append(
+                {
+                    "raw": match,
+                    "line": line[:180],
+                    "date": iso,
+                    "region": region,
+                    "score": score,
+                    "warnings": warnings,
+                }
+            )
+    return candidates
+
+
+def _choose_best_delivery_date(
+    fields: ExtractedFields,
+    full_text: str,
+    zone_texts: dict[str, str] | None = None,
+) -> tuple[str, list[str], list[dict[str, Any]]]:
+    zone_texts = zone_texts or {}
+    candidates: list[dict[str, Any]] = []
+
+    # structured candidates first
+    for src_key in ["delivery_date", "invoice_date", "dispatch_date", "due_date"]:
+        raw = str(fields.fields.get(src_key, "") or "").strip()
+        if not raw:
+            continue
+        iso = _normalize_date(raw)
+        if not iso:
+            continue
+        score = 1
+        warnings = []
+        if src_key != "delivery_date":
+            warnings.append("date_best_score_inferred")
+            score += 1
+        candidates.append(
+            {
+                "raw": raw,
+                "line": src_key,
+                "date": iso,
+                "region": "structured",
+                "score": score,
+                "warnings": warnings,
+            }
+        )
+
+    candidates.extend(_extract_date_candidates_from_lines(full_text, region="unknown"))
+    candidates.extend(_extract_date_candidates_from_lines(zone_texts.get("top", ""), region="top"))
+    candidates.extend(_extract_date_candidates_from_lines(zone_texts.get("mid", ""), region="mid"))
+    candidates.extend(_extract_date_candidates_from_lines(zone_texts.get("bottom", ""), region="bottom"))
+
+    if not candidates:
+        return "", [], []
+
+    # deterministic tie-break: higher score, then bottom/keyword-ish region, then earliest textual order
+    region_rank = {"bottom": 3, "structured": 2, "mid": 1, "top": 1, "unknown": 0}
+    best = sorted(
+        candidates,
+        key=lambda c: (int(c.get("score", 0)), region_rank.get(str(c.get("region")), 0)),
+        reverse=True,
+    )[0]
+    return str(best.get("date", "")), list(best.get("warnings", [])), candidates
 
 
 def _extract_with_gemini_vision(
@@ -992,11 +1120,20 @@ def _build_golden_verification_report(
     errors: list[str],
 ) -> dict[str, Any]:
     rename_success_count = 0
+    ok_confirmed = 0
+    ok_warnings = 0
+    warning_counter: collections.Counter[str] = collections.Counter()
     samples: list[str] = []
     for item in outputs:
         if item.get("status") == "ok" and item.get("output_file"):
             rename_success_count += 1
             samples.append(str(item.get("output_file")))
+            warnings = ((item.get("evidence") or {}).get("warning_codes") or [])
+            if warnings:
+                ok_warnings += 1
+                warning_counter.update([str(w) for w in warnings])
+            else:
+                ok_confirmed += 1
 
     pass_counts = (
         counts.get("total", 0) == _GOLDEN_EXPECTED_COUNT
@@ -1013,8 +1150,11 @@ def _build_golden_verification_report(
         "expected_count": _GOLDEN_EXPECTED_COUNT,
         "processed_count": counts.get("total", 0),
         "counts": counts,
+        "ok_confirmed": ok_confirmed,
+        "ok_warnings": ok_warnings,
         "rename_success_count": rename_success_count,
         "rename_samples": samples[:10],
+        "warning_code_frequency": dict(warning_counter),
         "pass_counts": pass_counts,
         "pass_rename": pass_rename,
         "pass_all": pass_counts and pass_rename,
@@ -1038,14 +1178,23 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
     try:
         evidence_dir = os.path.join(job_ctx.evidence_dir, digest[:12])
         os.makedirs(evidence_dir, exist_ok=True)
+        ext = os.path.splitext(path)[1].lower()
+        original_copy_path = os.path.join(evidence_dir, f"original{ext if ext else '.bin'}")
+        try:
+            shutil.copy2(path, original_copy_path)
+        except Exception:
+            pass
 
         text, extraction_meta = _extract_text(path)
         with open(os.path.join(evidence_dir, "ocr_raw.txt"), "w", encoding="utf-8") as f:
             f.write(text or "")
 
         preview_path = _first_page_image_for_vision(path, evidence_dir)
+        standardized_path = _standardize_pdf_for_evidence(path, evidence_dir)
         attempts: list[dict[str, Any]] = []
         hints = {"filename": basename, "source_key": source_key}
+        warning_codes: list[str] = []
+        zone_texts: dict[str, str] = {"top": "", "mid": "", "bottom": ""}
 
         # Pass A: OCR text + Gemini extraction.
         fields = extract_invoice_fields(text, hints)
@@ -1087,7 +1236,8 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
         # Pass C: Zone OCR retry + targeted vision retry.
         if issues and preview_path:
             zone_text = _zone_ocr_retry(preview_path)
-            text_c = "\n".join([t for t in [text, zone_text] if t]).strip()
+            zone_texts = zone_text or {"top": "", "mid": "", "bottom": ""}
+            text_c = "\n".join([t for t in [text, zone_texts.get("top", ""), zone_texts.get("mid", ""), zone_texts.get("bottom", "")] if t]).strip()
             c_fields_text = extract_invoice_fields(text_c, hints)
             c_issues = _required_rename_issues(c_fields_text)
             attempts.append(
@@ -1126,6 +1276,20 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
                         fields = c_fields_vision
                         issues = cv_issues
 
+        # Aggressive delivery-date resolution policy.
+        chosen_date, date_warnings, date_candidates = _choose_best_delivery_date(fields, text, zone_texts)
+        if chosen_date and not fields.fields.get("delivery_date"):
+            fields.fields["delivery_date"] = chosen_date
+            warning_codes.extend(date_warnings or ["date_best_score_inferred"])
+            if date_warnings:
+                warning_codes.extend(date_warnings)
+        fields.date_candidates = date_candidates
+        fields.warning_codes = sorted(set((fields.warning_codes or []) + warning_codes))
+        fields = _validate_fields(fields)
+        issues = _required_rename_issues(fields)
+        if float(fields.confidence_score or 0.0) < 0.8:
+            fields.warning_codes = sorted(set((fields.warning_codes or []) + ["low_confidence_extraction"]))
+
         debug_payload = {
             "source_file": basename,
             "source_key": source_key,
@@ -1133,6 +1297,9 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
             "attempts": attempts,
             "final_issues": issues,
             "final_fields": fields.fields,
+            "warning_codes": fields.warning_codes,
+            "date_candidates": fields.date_candidates,
+            "chosen_delivery_date": fields.fields.get("delivery_date", ""),
             "meta": extraction_meta,
         }
         with open(os.path.join(evidence_dir, "extraction_debug.json"), "w", encoding="utf-8") as f:
@@ -1146,6 +1313,7 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
             "ocr_text_excerpt": (text or "")[:1000],
             "fields": fields.fields,
             "meta": extraction_meta,
+            "warning_codes": fields.warning_codes,
             "debug_paths": {
                 "ocr_raw": os.path.relpath(os.path.join(evidence_dir, "ocr_raw.txt"), job_ctx.root_dir).replace("\\", "/"),
                 "preprocessed": (
@@ -1153,6 +1321,12 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
                     if preview_path and os.path.exists(preview_path)
                     else None
                 ),
+                "original": (
+                    os.path.relpath(original_copy_path, job_ctx.root_dir).replace("\\", "/")
+                    if os.path.exists(original_copy_path)
+                    else None
+                ),
+                "standardized": os.path.relpath(standardized_path, job_ctx.root_dir).replace("\\", "/"),
                 "extraction_debug": os.path.relpath(os.path.join(evidence_dir, "extraction_debug.json"), job_ctx.root_dir).replace("\\", "/"),
             },
         }
@@ -1169,10 +1343,12 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
             )
 
         normalized_name = _resolve_collision(_build_ok_filename(fields), job_ctx)
-        output = build_output_pdf(path, normalized_name, job_ctx.ok_dir)
+        target_dir = job_ctx.ok_warnings_dir if fields.warning_codes else job_ctx.ok_confirmed_dir
+        output = os.path.join(target_dir, normalized_name)
+        shutil.copy2(standardized_path, output)
         return DocumentResult(
             status="ok",
-            reason="validated",
+            reason="validated_with_warnings" if fields.warning_codes else "validated",
             output_file=output,
             evidence=base_evidence,
         )
@@ -1198,6 +1374,17 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
 
 def _zip_results(ctx: JobContext):
     with zipfile.ZipFile(ctx.output_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Keep deterministic top-level folder structure visible even when empty.
+        for folder in [
+            "artifacts/",
+            "artifacts/OK/",
+            "artifacts/OK/CONFIRMED/",
+            "artifacts/OK/WARNINGS/",
+            "artifacts/Review/",
+            "artifacts/Failed/",
+            "evidence/",
+        ]:
+            zf.writestr(folder, "")
         for root, _, files in os.walk(ctx.root_dir):
             for file_name in files:
                 if file_name == os.path.basename(ctx.output_zip_path):
@@ -1239,6 +1426,8 @@ def run_invoice_job(payload: dict) -> str:
     outputs: list[dict[str, Any]] = []
     review_items: list[dict[str, Any]] = []
     errors: list[str] = []
+    review_reason_counter: collections.Counter[str] = collections.Counter()
+    warning_counter: collections.Counter[str] = collections.Counter()
 
     _log_line(ctx, f"Invoice job started input={input_path}")
     if task_id:
@@ -1286,6 +1475,11 @@ def run_invoice_job(payload: dict) -> str:
         outputs.append(item)
         if result.status in {"review", "failed"}:
             review_items.append(item)
+            for code in [c for c in str(result.reason or "").split(";") if c]:
+                review_reason_counter.update([code.strip()])
+        if result.status == "ok":
+            warnings = ((result.evidence or {}).get("warning_codes") or [])
+            warning_counter.update([str(w) for w in warnings if str(w)])
 
         if task_id and counts["total"] > 0:
             progress = 20 + int((idx / counts["total"]) * 70)
@@ -1304,8 +1498,19 @@ def run_invoice_job(payload: dict) -> str:
         outputs={
             "output_zip": os.path.relpath(ctx.output_zip_path, cfg.base_dir),
             "ok_dir": os.path.relpath(ctx.ok_dir, ctx.root_dir),
+            "ok_confirmed_dir": os.path.relpath(ctx.ok_confirmed_dir, ctx.root_dir),
+            "ok_warnings_dir": os.path.relpath(ctx.ok_warnings_dir, ctx.root_dir),
             "review_dir": os.path.relpath(ctx.review_dir, ctx.root_dir),
             "failed_dir": os.path.relpath(ctx.failed_dir, ctx.root_dir),
+            "ok_confirmed": sum(
+                1 for x in outputs if x.get("status") == "ok" and not ((x.get("evidence") or {}).get("warning_codes") or [])
+            ),
+            "ok_warnings": sum(
+                1 for x in outputs if x.get("status") == "ok" and ((x.get("evidence") or {}).get("warning_codes") or [])
+            ),
+            "rename_success_count": sum(1 for x in outputs if x.get("status") == "ok" and x.get("output_file")),
+            "review_reason_counts": dict(review_reason_counter),
+            "warning_code_counts": dict(warning_counter),
             "items": outputs,
         },
         errors=errors,
