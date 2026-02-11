@@ -13,12 +13,19 @@ try:
 except Exception:
     pass
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MEMORY_DB_PATH = os.path.join(BASE_DIR, "memory_store", "victor_memory.db")
-WORKSPACE_DIR = os.path.join(BASE_DIR, "workspace")
-SERVER_DEBUG_PATH = os.path.join(BASE_DIR, "server_debug.txt")
-SERVER_STREAM_DEBUG_PATH = os.path.join(BASE_DIR, "server_debug_stream.txt")
-MEMORY_V3_ENABLED = os.getenv("MEMORY_V3_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+from config import get_config, validate_or_raise
+from logging_config import get_logger, setup_logging, new_correlation_id
+from session_manager import get_session_service, resolve_user_id, resolve_session_id
+from resilience import telegram_breaker, gemini_breaker
+
+cfg = validate_or_raise(get_config())
+setup_logging(cfg.log_dir)
+logger = get_logger("telegram_server")
+
+BASE_DIR = cfg.base_dir
+MEMORY_DB_PATH = cfg.memory_db_path
+WORKSPACE_DIR = cfg.workspace_dir
+MEMORY_V3_ENABLED = cfg.memory_v3_enabled
 
 
 def _resolve_runtime_path(path_text):
@@ -38,52 +45,92 @@ def _resolve_runtime_path(path_text):
 try:
     me = singleton.SingleInstance()
 except singleton.SingleInstanceException:
-    with open(SERVER_DEBUG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{os.getpid()}] Singleton lock - exiting.\n")
+    logger.warning("Singleton lock — another instance running. Exiting.")
     sys.exit(0)
 
-# --- STARTUP LOG ---
-with open(SERVER_DEBUG_PATH, "a", encoding="utf-8") as f:
-    f.write(f"\n--- SERVER STARTUP [{os.getpid()}] ---\n")
+logger.info("Telegram server starting up")
 
 from google.adk import Runner
-from google.adk.sessions.sqlite_session_service import SqliteSessionService
 from google.genai import types
-from agents import (
-    chief_of_staff, 
-    research_agent, 
-    dev_agent, 
-    data_agent, 
-    script_agent, 
-    academic_agent
-)
+from agents import chief_of_staff, get_skill_registry
 from tools import transcribe_audio_file, generate_tts_file
 from monitor import log_activity
 from memory_core import MemoryQueryInput, MemoryRecordInput, recall_memory, save_memory
 from memory_policy import classify_memory_candidate, redact_sensitive
 from sitrep_builder import build_executive_sitrep
 
-
 # --- CONFIGURATION ---
-BOT_TOKEN = "7770925936:AAFfZs38EmdCsS8BUS5x2LT3kNV6on5AdzY"
+BOT_TOKEN = cfg.telegram_bot_token
 
-print("🔌 Connecting to Telegram...")
+logger.info("Connecting to Telegram...")
 bot = telebot.TeleBot(BOT_TOKEN)
-session_service = SqliteSessionService(db_path=MEMORY_DB_PATH)
+session_service = get_session_service()
 
 # Initialize Runner
 runner = Runner(
-    agent=chief_of_staff, 
+    agent=chief_of_staff,
     session_service=session_service,
     app_name="victor_os",
     auto_create_session=True
 )
 
-print(f"🤖 Victor-OS (Multimodal Mode) is Online! (Bot ID: {BOT_TOKEN.split(':')[0]})")
+logger.info(f"Victor-OS (Multimodal Mode) is Online! (Bot ID: {BOT_TOKEN.split(':')[0]})")
+
+# --- START TASK QUEUE & PROACTIVE ENGINE ---
+from task_queue import TaskQueue
+
+_task_queue = TaskQueue()
+
+def _notify_user_telegram(user_id, channel, message):
+    """Push task/proactive notifications to Telegram."""
+    try:
+        target = str(user_id or "").strip() if channel == "telegram" and str(user_id or "").strip() else cfg.telegram_target_id
+        if target:
+            telegram_breaker.call(bot.send_message, target, message)
+    except Exception as e:
+        logger.error(f"Notification push failed: {e}")
+
+
+def _notify_user_whatsapp(user_id, message):
+    """Optional WhatsApp fanout via Twilio REST if configured."""
+    if not (cfg.whatsapp_enabled and cfg.twilio_sid and cfg.twilio_auth_token and cfg.twilio_whatsapp_number):
+        return
+    try:
+        from twilio.rest import Client
+        target = str(user_id or "").strip()
+        if not target.startswith("whatsapp:"):
+            target = f"whatsapp:{target}"
+        client = Client(cfg.twilio_sid, cfg.twilio_auth_token)
+        client.messages.create(
+            body=message,
+            from_=cfg.twilio_whatsapp_number,
+            to=target,
+        )
+    except Exception as e:
+        logger.warning(f"WhatsApp fanout failed: {e}")
+
+_task_queue.set_notify_callback(_notify_user_telegram)
+_task_queue.start_worker()
+
+# Start proactive engine if skills have checks
+try:
+    from proactive_engine import ProactiveEngine
+    _skill_registry = get_skill_registry()
+    if _skill_registry and cfg.proactive_enabled:
+        _proactive = ProactiveEngine()
+        _proactive.register_checks_from_registry(_skill_registry.get_proactive_checks())
+        _proactive.set_notify_callback(_notify_user_telegram)
+        _proactive.add_channel_notifier("telegram", lambda user_id, message: _notify_user_telegram(user_id, "telegram", message))
+        _proactive.add_channel_notifier("whatsapp", _notify_user_whatsapp)
+        _proactive.start()
+        logger.info("Proactive engine started")
+except Exception as e:
+    logger.warning(f"Proactive engine not started: {e}")
+
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🚀 Victor-OS is Online. I can read your texts, hear your voice, and analyze your photos!")
+    bot.reply_to(message, "Victor-OS is Online. I can read your texts, hear your voice, and analyze your photos!")
 
 # --- SAFETY VALVE (Auto-Splitter) ---
 def send_smart_message(chat_id, text, reply_to_id=None):
@@ -91,20 +138,19 @@ def send_smart_message(chat_id, text, reply_to_id=None):
     MAX_LENGTH = 4000
     if len(text) <= MAX_LENGTH:
         if reply_to_id:
-            return bot.reply_to(reply_to_id, text)
+            return telegram_breaker.call(bot.reply_to, reply_to_id, text)
         else:
-            return bot.send_message(chat_id, text)
-    
-    # Split into chunks
+            return telegram_breaker.call(bot.send_message, chat_id, text)
+
     chunks = [text[i:i + MAX_LENGTH] for i in range(0, len(text), MAX_LENGTH)]
     total = len(chunks)
-    
+
     for i, chunk in enumerate(chunks):
-        formatted_chunk = f"📄 (Part {i+1}/{total})\n\n{chunk}"
+        formatted_chunk = f"(Part {i+1}/{total})\n\n{chunk}"
         if i == 0 and reply_to_id:
-            bot.reply_to(reply_to_id, formatted_chunk)
+            telegram_breaker.call(bot.reply_to, reply_to_id, formatted_chunk)
         else:
-            bot.send_message(chat_id, formatted_chunk)
+            telegram_breaker.call(bot.send_message, chat_id, formatted_chunk)
     return True
 
 
@@ -304,7 +350,7 @@ def _build_session_context(user_id: str, limit: int = 16) -> str:
                 f"[HISTORY LOG]\n{history_str}\n"
             )
     except Exception as e:
-        print(f"⚠️ Session context failed: {e}")
+        logger.warning(f"Session context failed: {e}")
     return history_context
 
 
@@ -413,21 +459,10 @@ def _save_deterministic_memories(user_text: str, final_answer: str, tool_names: 
             sensitive_refs=sensitive_refs,
         )
         result = save_memory(record)
-        with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
-            f.write(
-                "MEMORY_SAVE: "
-                + json.dumps(
-                    {
-                        "status": result.get("status"),
-                        "ok": result.get("ok"),
-                        "id": result.get("id"),
-                        "type": record.memory_type,
-                        "scope": record.scope,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+        logger.debug(
+            f"MEMORY_SAVE: status={result.get('status')} id={result.get('id')} type={record.memory_type}",
+            extra={"agent_name": "memory_v3"},
+        )
 
     for agent_name in delegated_agents:
         handoff = MemoryRecordInput(
@@ -439,102 +474,89 @@ def _save_deterministic_memories(user_text: str, final_answer: str, tool_names: 
             source="telegram_handoff",
             tags=["handoff"],
         )
-        result = save_memory(handoff)
-        with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"MEMORY_HANDOFF_SAVE: {json.dumps(result, ensure_ascii=False)}\n")
+        save_memory(handoff)
 
 # --- VOICE HANDLER ---
 @bot.message_handler(content_types=['voice'])
 def handle_voice(message):
+    cid = new_correlation_id()
     user_id = str(message.chat.id)
-    print(f"\n🎙️ INCOMING VOICE from {message.from_user.first_name}")
+    logger.info(f"Voice note from {message.from_user.first_name}", extra={"channel": "telegram", "user_id": user_id})
     bot.send_chat_action(message.chat.id, 'record_audio')
 
     try:
         log_activity("Telegram User", "Voice Note Received", "Info")
-        # 1. Download the voice file
         file_info = bot.get_file(message.voice.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
+
         voice_path = f"voice_{message.chat.id}.ogg"
         with open(voice_path, 'wb') as new_file:
             new_file.write(downloaded_file)
-        
-        # 2. Transcribe
-        print("⏳ Transcribing...")
+
         user_text = transcribe_audio_file(voice_path)
-        
-        if not user_text or user_text.startswith("❌"):
-            bot.reply_to(message, "⚠️ Sorry, I couldn't understand that audio.")
+
+        if not user_text or user_text.startswith("Transcription Error"):
+            bot.reply_to(message, "Sorry, I couldn't understand that audio.")
             return
-    
-        print(f"🗣️ Transcribed: '{user_text}'")
-        
-        # 3. Process as normal message
+
+        logger.info(f"Transcribed: '{user_text}'", extra={"channel": "telegram", "user_id": user_id})
         process_message(message, user_text)
 
-        # Cleanup
         if os.path.exists(voice_path): os.remove(voice_path)
         wav_path = voice_path.replace(".ogg", ".wav")
         if os.path.exists(wav_path): os.remove(wav_path)
 
     except Exception as e:
-        print(f"❌ Voice Error: {e}")
+        logger.error(f"Voice error: {e}", extra={"channel": "telegram", "user_id": user_id})
         bot.reply_to(message, f"Voice System Error: {e}")
 
 # --- PHOTO HANDLER ---
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
+    cid = new_correlation_id()
     user_id = str(message.chat.id)
     caption = message.caption if message.caption else "Analyze this image."
-    print(f"\n🖼️ INCOMING PHOTO from {message.from_user.first_name}: {caption}")
+    logger.info(f"Photo from {message.from_user.first_name}: {caption}", extra={"channel": "telegram", "user_id": user_id})
     bot.send_chat_action(message.chat.id, 'upload_photo')
 
     try:
         log_activity("Telegram User", "Photo Received", "Info", f"Caption: {caption}")
-        # 1. Get the largest photo
         file_info = bot.get_file(message.photo[-1].file_id)
         image_data = bot.download_file(file_info.file_path)
-
-        # 2. Process
         process_message(message, caption, image_data=image_data)
 
     except Exception as e:
-        print(f"❌ Photo Error: {e}")
+        logger.error(f"Photo error: {e}", extra={"channel": "telegram", "user_id": user_id})
         bot.reply_to(message, f"Vision System Error: {e}")
 
-# --- DOCUMENT HANDLER (Universal Downloader) ---
+# --- DOCUMENT HANDLER ---
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
+    cid = new_correlation_id()
     user_id = str(message.chat.id)
     file_name = message.document.file_name
-    print(f"\n📁 INCOMING DOCUMENT from {message.from_user.first_name}: {file_name}")
+    logger.info(f"Document from {message.from_user.first_name}: {file_name}", extra={"channel": "telegram", "user_id": user_id})
     bot.send_chat_action(message.chat.id, 'upload_document')
-    
+
     try:
         log_activity("Telegram User", "Document Received", "Info", f"File: {file_name}")
-        
-        # 1. Ensure workspace exists
-        if not os.path.exists(WORKSPACE_DIR):
-            os.makedirs(WORKSPACE_DIR)
-            
-        # 2. Download the file
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
+
         file_path = os.path.join(WORKSPACE_DIR, file_name)
         with open(file_path, 'wb') as new_file:
             new_file.write(downloaded_file)
-            
-        # 3. Inform the Agent
+
         system_note = f"User uploaded a file available at: {file_path}. Use Python to read/analyze it if requested."
         user_text = message.caption if message.caption else f"I've uploaded {file_name}."
         combined_text = f"{user_text}\n\n[SYSTEM NOTE: {system_note}]"
-        
+
         process_message(message, combined_text)
-        
+
     except Exception as e:
-        print(f"❌ Document Error: {e}")
+        logger.error(f"Document error: {e}", extra={"channel": "telegram", "user_id": user_id})
         bot.reply_to(message, f"File System Error: {e}")
 
 # --- TEXT HANDLER ---
@@ -543,8 +565,9 @@ def handle_text(message):
     process_message(message, message.text)
 
 def process_message(message, user_text, image_data=None):
+    cid = new_correlation_id()
     user_id = str(message.chat.id)
-    print(f"\n📩 PROCESSING: {user_text} {'(with image)' if image_data else ''}")
+    logger.info(f"Processing: {user_text[:80]}{'...' if len(user_text) > 80 else ''} {'(with image)' if image_data else ''}", extra={"channel": "telegram", "user_id": user_id})
     bot.send_chat_action(message.chat.id, 'typing')
     log_activity("Telegram User", "Input Received", "Info", f"Text: {user_text[:50]}...")
 
@@ -554,7 +577,7 @@ def process_message(message, user_text, image_data=None):
         memory_context = _build_memory_context(user_text)
         global_block = _format_hits_block("GLOBAL_CONTEXT", memory_context["global_hits"])
         agent_block = _format_hits_block("AGENT_CONTEXT", memory_context["agent_hits"])
-        print(f"🧠 Memory context loaded: global={len(memory_context['global_hits'])}, agent={len(memory_context['agent_hits'])}")
+        logger.debug(f"Memory context loaded: global={len(memory_context['global_hits'])}, agent={len(memory_context['agent_hits'])}")
 
         sitrep_requested = bool(re.search(r"\b(sitrep|situation report|status report)\b", user_text.lower()))
         if MEMORY_V3_ENABLED and sitrep_requested:
@@ -584,27 +607,21 @@ def process_message(message, user_text, image_data=None):
         )
 
         # 2. Start the Stream
+        resolved_uid = resolve_user_id("telegram", user_id)
+        resolved_sid = resolve_session_id("telegram", user_id)
+
         event_stream = runner.run(
-            user_id=user_id,
-            session_id=user_id, 
+            user_id=resolved_uid,
+            session_id=resolved_sid,
             new_message=new_message
         )
-        
+
         final_answer = ""
         tool_names = []
         delegated_agents = []
-        with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"\n--- EVENT STREAM START ({user_text}) ---\n")
-            f.write(f"DEBUG: new_message='{new_message}'\n")
-            
+
         try:
             for event in event_stream:
-                # --- DEBUG LOGGING ---
-                with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
-                    f.write(f"EVENT_TYPE: {type(event)}\n")
-                    f.write(f"EVENT_REPR: {repr(event)[:2000]}\n")
-
-                # 1. Capture Tool Calls (Metadata)
                 detected_tools = _extract_tool_names_from_node(event)
                 if detected_tools:
                     tool_names.extend(detected_tools)
@@ -612,38 +629,34 @@ def process_message(message, user_text, image_data=None):
                 if isinstance(author_name, str) and author_name and author_name != "Chief_of_Staff":
                     delegated_agents.append(author_name)
 
-                # 2. Extract text across all known/unknown event structures
                 text_chunks = _unique_text_chunks(_extract_text_from_node(event))
                 if text_chunks:
                     final_answer += "".join(text_chunks)
-                    
+
         except Exception as e:
-             with open(SERVER_STREAM_DEBUG_PATH, "a", encoding="utf-8") as f:
-                f.write(f"ERROR: Event Loop Failed: {e}\n")
+            logger.error(f"Event loop failed: {e}", extra={"channel": "telegram", "user_id": user_id})
 
         # 3. Decision: Text or Voice Reply?
         should_speak = "speak" in user_text.lower() or "say" in user_text.lower()
-        
-        # 4. Final Fallback Logic (The Safety Net)
+
+        # 4. Final Fallback Logic
         unique_tools = _unique_text_chunks(tool_names)
         delegated_agents = _unique_text_chunks(delegated_agents)
         if not final_answer.strip():
             if unique_tools:
-                # Deterministic status summary when tool-only events occur.
                 tool_summary = ", ".join(unique_tools[:3])
                 final_answer = f"Completed your request using: {tool_summary}. If you want, I can provide a concise result summary next."
             else:
-                # If absolutely nothing happened, the model failed to generate.
-                final_answer = "⚠️ I received your input, but I was unable to generate a response. Please check the system logs."
+                final_answer = "I received your input, but I was unable to generate a response. Please check the system logs."
 
         _save_deterministic_memories(user_text, final_answer, unique_tools, delegated_agents)
 
         if should_speak:
-            print("🔊 Generating Voice Response...")
+            logger.info("Generating voice response", extra={"channel": "telegram", "user_id": user_id})
             audio_path = generate_tts_file(final_answer, f"reply_{user_id}.mp3")
-            if not audio_path.startswith("❌"):
+            if not audio_path.startswith("TTS Generation Error"):
                 with open(audio_path, 'rb') as audio:
-                    bot.send_voice(message.chat.id, audio)
+                    telegram_breaker.call(bot.send_voice, message.chat.id, audio)
                 os.remove(audio_path)
                 log_activity("Chief_of_Staff", "Voice Response Sent", "Success")
             else:
@@ -652,29 +665,29 @@ def process_message(message, user_text, image_data=None):
         else:
             # --- COURIER PROTOCOL (Auto-Upload) ---
             file_match = re.search(r"<<SEND_FILE:\s*(.*?)>>", final_answer)
-            
+
             if file_match:
                 raw_path = file_match.group(1).strip()
                 resolved_path = _resolve_runtime_path(raw_path)
                 clean_answer = final_answer.replace(file_match.group(0), "").strip()
-                
+
                 if clean_answer:
                     send_smart_message(message.chat.id, clean_answer, reply_to_id=message)
-                
-                print(f"📦 COURIER: Shipping {resolved_path}...")
+
+                logger.info(f"COURIER: Shipping {resolved_path}", extra={"channel": "telegram"})
                 if os.path.exists(resolved_path):
                     with open(resolved_path, 'rb') as doc:
-                        bot.send_document(message.chat.id, doc)
+                        telegram_breaker.call(bot.send_document, message.chat.id, doc)
                     log_activity("Chief_of_Staff", "Courier Successful", "Success", f"File: {resolved_path}")
                 else:
-                    send_smart_message(message.chat.id, f"❌ Courier Error: File not found at {raw_path}", reply_to_id=message)
+                    send_smart_message(message.chat.id, f"Courier Error: File not found at {raw_path}", reply_to_id=message)
                     log_activity("Chief_of_Staff", "Courier Failed", "Error", f"Missing: {resolved_path}")
             else:
                 send_smart_message(message.chat.id, final_answer, reply_to_id=message)
                 log_activity("Chief_of_Staff", "Text Response Sent", "Success")
-            
+
     except Exception as e:
-        print(f"❌ Error: {e}")
+        logger.error(f"Processing error: {e}", extra={"channel": "telegram", "user_id": user_id})
         bot.reply_to(message, f"System Error: {e}")
         log_activity("System", "Error", "Failed", str(e))
 

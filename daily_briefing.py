@@ -1,108 +1,150 @@
+import os
+import sys
 import time
-import datetime
 import schedule
 import telebot
-from dotenv import load_dotenv
+
 from google.adk import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types
-from agents import (
-    chief_of_staff, 
-    research_agent, 
-    dev_agent, 
-    data_agent, 
-    script_agent, 
-    academic_agent
-)
 
-# Load environment
-load_dotenv()
+from agents import chief_of_staff
+from config import get_config, validate_or_raise
+from logging_config import get_logger, new_correlation_id, setup_logging
+from resilience import telegram_breaker
+from session_manager import get_session_service
+from task_queue import TaskQueue
+from workflow_engine import WorkflowEngine
+from skills.ops_health_check import OpsHealthCheckSkill
+from skills.market_watch import MarketWatchSkill
+from skills.memory_hygiene import MemoryHygieneSkill
 
-# --- CONFIGURATION ---
-BOT_TOKEN = "7770925936:AAFfZs38EmdCsS8BUS5x2LT3kNV6on5AdzY"
-TARGET_TELEGRAM_ID = "1322285119"
 
-bot = telebot.TeleBot(BOT_TOKEN)
-session_service = InMemorySessionService()
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
-# Initialize Runner with the Chef (Root)
+cfg = validate_or_raise(get_config())
+setup_logging(cfg.log_dir)
+logger = get_logger("daily_briefing")
+
+bot = telebot.TeleBot(cfg.telegram_bot_token)
+session_service = get_session_service()
+
 runner = Runner(
     app_name="VictorOS_Briefing",
     agent=chief_of_staff,
     session_service=session_service,
-    auto_create_session=True
+    auto_create_session=True,
 )
 
-def job_morning_briefing():
-    print(f"🌅 Waking up... Preparing Daily Briefing for {TARGET_TELEGRAM_ID}...")
-    
-    # 1. The Mission: Gather Intelligence
-    # We ask the Chief to coordinate this.
-    prompt = """
-    MORNING BRIEFING TASK:
-    1. Research the current price of Bitcoin and Ethereum (Live).
-    2. Research one major AI news headline from the last 24 hours.
-    3. Research one key business headline from Lagos, Nigeria.
-    
-    Format the results as a short report with emojis. 
-    Maintain a professional but visionary tone.
-    """
+queue = TaskQueue()
 
-    try:
-        new_message = types.Content(
-            role="user",
-            parts=[types.Part(text=prompt)]
+
+def _collect_stream_text(events):
+    final = ""
+    for event in events:
+        if hasattr(event, "text") and event.text:
+            final += event.text
+            continue
+        content = getattr(event, "content", None)
+        if content and getattr(content, "parts", None):
+            for part in content.parts:
+                if getattr(part, "text", None):
+                    final += part.text
+            continue
+        candidates = getattr(event, "candidates", None)
+        if candidates:
+            for candidate in candidates:
+                c_content = getattr(candidate, "content", None)
+                if c_content and getattr(c_content, "parts", None):
+                    for part in c_content.parts:
+                        if getattr(part, "text", None):
+                            final += part.text
+    return final.strip()
+
+
+def run_briefing_job(payload: dict) -> str:
+    cid = new_correlation_id()
+    target = cfg.telegram_target_id
+    engine = WorkflowEngine()
+    engine.load_definitions_from_dir()
+    ops = OpsHealthCheckSkill()
+    market = MarketWatchSkill()
+    memory_hygiene = MemoryHygieneSkill()
+
+    def _action_ops_health_summary(params, context):
+        return ops.tool_ops_health_summary()
+
+    def _action_compose_daily_ops_report(params, context):
+        prompt = (
+            "MORNING BRIEFING TASK:\n"
+            "1. Research the current price of Bitcoin and Ethereum.\n"
+            "2. Find one major AI headline in the last 24 hours.\n"
+            "3. Find one key business headline from Lagos, Nigeria.\n"
+            "Return a concise executive report."
         )
-
-        # 2. Run the agent stream
+        new_message = types.Content(role="user", parts=[types.Part(text=prompt)])
         events = runner.run(
-            user_id="briefing_system", 
+            user_id="briefing_system",
             session_id="daily_briefing_session",
-            new_message=new_message
+            new_message=new_message,
         )
-        
-        # Collect response text
-        text_content = ""
-        for event in events:
-            # 1. Check for basic .text
-            if hasattr(event, 'text') and event.text:
-                text_content += event.text
-            # 2. Check for standard Event.content.parts
-            elif event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.text:
-                        text_content += part.text
-            # 3. Check for deep structure candidates
-            elif hasattr(event, 'candidates') and event.candidates:
-                for candidate in event.candidates:
-                    if hasattr(candidate, 'content') and candidate.content:
-                        for part in candidate.content.parts:
-                             if hasattr(part, 'text') and part.text:
-                                text_content += part.text
+        text = _collect_stream_text(events)
+        if not text:
+            text = "Morning briefing returned no content."
+        return "Victor-OS Morning Briefing\n\n" + text
 
-        if not text_content:
-            text_content = "⚠️ Morning briefing research returned no data. Check internet connection."
+    def _action_market_snapshot(params, context):
+        return market.tool_market_snapshot()
 
-        message = f"🤖 *Victor-OS Morning Briefing*\n{'-'*30}\n\n{text_content}"
-        
-        # 3. Send via Telegram Bot API
-        print(f"🚀 Pushing to Telegram ID: {TARGET_TELEGRAM_ID}...")
-        bot.send_message(TARGET_TELEGRAM_ID, message)
-        print("✅ Briefing Delivered.")
+    def _action_memory_hygiene(params, context):
+        return memory_hygiene.tool_memory_hygiene_report()
 
-    except Exception as e:
-        print(f"❌ Briefing Execution Error: {e}")
+    def _action_notify(params, context):
+        return str(params.get("message", "Notification sent."))
 
-# --- THE SCHEDULE ---
-# This runs the job every day at 08:00 AM
-schedule.every().day.at("08:00").do(job_morning_briefing)
+    engine.register_action("ops_health_summary", _action_ops_health_summary)
+    engine.register_action("compose_daily_ops_report", _action_compose_daily_ops_report)
+    engine.register_action("market_snapshot", _action_market_snapshot)
+    engine.register_action("memory_hygiene", _action_memory_hygiene)
+    engine.register_action("notify", _action_notify)
 
-# --- TEST MODE ---
-# Triggering immediately for verification as requested by the plan
-print("🔧 Initializing System Check: Running first briefing...")
-job_morning_briefing() 
+    wf_name = payload.get("workflow_name", "ops_daily_brief")
+    wf_run = engine.execute(wf_name)
+    message = str(wf_run.context.get("step_notify_user_result") or wf_run.context.get("step_format_report_result") or "Daily briefing completed.")
+    if target:
+        telegram_breaker.call(bot.send_message, target, message)
+    logger.info(f"Daily briefing delivered via workflow={wf_name}", extra={"channel": "telegram", "user_id": target})
+    return f"Daily briefing workflow '{wf_name}' sent."
 
-print(f"🤖 Victor-OS Scheduler is Online. Monitoring for 8:00 AM... (Target: {TARGET_TELEGRAM_ID})")
-while True:
-    schedule.run_pending()
-    time.sleep(60)
+
+def enqueue_briefing():
+    task_id = queue.enqueue(
+        task_type="daily_briefing",
+        payload={"workflow_name": "ops_daily_brief"},
+        channel="telegram",
+        user_id=cfg.telegram_target_id or "ceejay",
+        priority=2,
+    )
+    logger.info(f"Queued daily briefing task {task_id}")
+
+
+def main():
+    queue.register_handler("daily_briefing", run_briefing_job)
+    queue.start_worker()
+
+    schedule.every().day.at(os.getenv("DAILY_BRIEFING_TIME", "08:00")).do(enqueue_briefing)
+
+    if cfg.daily_briefing_boot_run:
+        enqueue_briefing()
+
+    logger.info("Daily briefing scheduler online")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()
