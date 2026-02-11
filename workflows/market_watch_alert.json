@@ -1,0 +1,22 @@
+{
+  "name": "market_watch_alert",
+  "description": "Fetch latest tracked market prices and notify on demand.",
+  "trigger": "manual",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "snapshot",
+      "action": "market_snapshot",
+      "params": {},
+      "retries": 1
+    },
+    {
+      "name": "notify_user",
+      "action": "notify",
+      "params": {
+        "message": "$ctx.step_snapshot_result"
+      },
+      "retries": 1
+    }
+  ]
+}

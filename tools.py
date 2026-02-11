@@ -14,15 +14,17 @@ import speech_recognition as sr
 from io import StringIO
 from pypdf import PdfReader
 from docx import Document
-from dotenv import load_dotenv
 from pydub import AudioSegment
 import pyautogui
 
-# Load keys
-load_dotenv()
-MY_EMAIL = os.getenv("EMAIL_USER")
-MY_PASS = os.getenv("EMAIL_PASS")
-MY_TARGET = os.getenv("TO_EMAIL")
+from config import get_config
+from logging_config import get_logger, setup_logging
+from resilience import retry_with_backoff
+
+cfg = get_config()
+setup_logging(cfg.log_dir)
+logger = get_logger("tools")
+
 
 # --- TOOL 1: THE UNIVERSAL READER ---
 def universal_file_reader(file_path: str) -> str:
@@ -30,7 +32,7 @@ def universal_file_reader(file_path: str) -> str:
     try:
         clean_path = file_path.strip().strip('"').strip("'")
         if not os.path.exists(clean_path):
-            return f"❌ Error: File not found at {clean_path}"
+            return f"Error: File not found at {clean_path}"
 
         ext = clean_path.strip().split('.')[-1].lower()
 
@@ -57,7 +59,8 @@ def universal_file_reader(file_path: str) -> str:
             with open(clean_path, 'r', encoding='utf-8', errors='ignore') as f:
                 return f"--- TEXT --- {f.read()} --- END ---"
     except Exception as e:
-        return f"❌ Error reading file: {e}"
+        logger.error(f"File read error: {e}", extra={"tool_name": "universal_file_reader"})
+        return f"Error reading file: {e}"
 
 # --- TOOL 2: THE EXECUTION ENGINE ---
 def execute_python_code(code: str) -> str:
@@ -66,7 +69,7 @@ def execute_python_code(code: str) -> str:
     old_stdout = sys.stdout
     redirected_output = StringIO()
     sys.stdout = redirected_output
-    
+
     try:
         local_scope = {
             'pd': pd,
@@ -78,22 +81,23 @@ def execute_python_code(code: str) -> str:
         }
         exec(clean_code, globals(), local_scope)
         sys.stdout = old_stdout
-        return f"✅ Execution Successful.\nOutput:\n{redirected_output.getvalue()}"
+        return f"Execution Successful.\nOutput:\n{redirected_output.getvalue()}"
     except Exception as e:
         sys.stdout = old_stdout
-        return f"❌ Execution Error: {e}"
+        logger.error(f"Code execution error: {e}", extra={"tool_name": "execute_python_code"})
+        return f"Execution Error: {e}"
 
 # --- TOOL 3: THE VOICE ---
 def speak_out_loud(text: str) -> str:
     """Reads text out loud."""
     try:
         engine = pyttsx3.init()
-        engine.setProperty('rate', 170) 
+        engine.setProperty('rate', 170)
         engine.say(text)
         engine.runAndWait()
-        return "✅ Audio played successfully."
+        return "Audio played successfully."
     except Exception as e:
-        return f"❌ Audio Error: {e}"
+        return f"Audio Error: {e}"
 
 def generate_tts_file(text: str, filename: str = "response.mp3") -> str:
     """Generates a TTS audio file and returns the path."""
@@ -103,7 +107,7 @@ def generate_tts_file(text: str, filename: str = "response.mp3") -> str:
         engine.runAndWait()
         return os.path.abspath(filename)
     except Exception as e:
-        return f"❌ TTS Generation Error: {e}"
+        return f"TTS Generation Error: {e}"
 
 # --- TOOL 4: THE LISTENER ---
 def listen_to_user() -> str:
@@ -111,17 +115,13 @@ def listen_to_user() -> str:
     r = sr.Recognizer()
     try:
         with sr.Microphone() as source:
-            print("\n👂 Listening... (Speak now!)")
+            logger.info("Listening for voice input", extra={"tool_name": "listen_to_user"})
             r.adjust_for_ambient_noise(source, duration=1)
             audio = r.listen(source, timeout=5, phrase_time_limit=15)
-            
-            print("⏳ Processing...")
             text = r.recognize_google(audio)
-            print(f"🗣️ You said: '{text}'")
+            logger.info(f"Transcribed: '{text}'", extra={"tool_name": "listen_to_user"})
             return text
-            
-    except Exception as e:
-        # Graceful fallback for PyAudio/Mic issues
+    except Exception:
         return ""
 
 def transcribe_audio_file(file_path: str) -> str:
@@ -130,7 +130,6 @@ def transcribe_audio_file(file_path: str) -> str:
     try:
         ext = file_path.split('.')[-1].lower()
         if ext != 'wav':
-            # Convert to wav for speech_recognition
             audio = AudioSegment.from_file(file_path)
             wav_path = file_path.replace(f".{ext}", ".wav")
             audio.export(wav_path, format="wav")
@@ -141,28 +140,27 @@ def transcribe_audio_file(file_path: str) -> str:
             text = r.recognize_google(audio_data)
             return text
     except Exception as e:
-        return f"❌ Transcription Error: {e}"
+        return f"Transcription Error: {e}"
 
 # --- TOOL 5: THE OUTBOX (Email) ---
+@retry_with_backoff(max_retries=2, base_delay=2.0, exceptions=(smtplib.SMTPException, ConnectionError, OSError))
 def send_email_alert(subject: str, body: str) -> str:
-    """
-    Sends an email to Victor's primary address. 
-    Use this for sending finished reports, urgent alerts, or reminders.
-    """
+    """Sends an email to Victor's primary address."""
     try:
         msg = MIMEText(body)
-        msg['Subject'] = f"🤖 Victor-OS: {subject}"
-        msg['From'] = MY_EMAIL
-        msg['To'] = MY_TARGET
+        msg['Subject'] = f"Victor-OS: {subject}"
+        msg['From'] = cfg.email_user
+        msg['To'] = cfg.email_target
 
-        # Connect to Gmail Server
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(MY_EMAIL, MY_PASS)
+            server.login(cfg.email_user, cfg.email_pass)
             server.send_message(msg)
-        
-        return "✅ Email sent successfully."
+
+        logger.info(f"Email sent: {subject}", extra={"tool_name": "send_email_alert"})
+        return "Email sent successfully."
     except Exception as e:
-        return f"❌ Email failed: {e}"
+        logger.error(f"Email failed: {e}", extra={"tool_name": "send_email_alert"})
+        return f"Email failed: {e}"
 
 
 # --- TOOL 6: THE SYSTEM GUARDIAN ---
@@ -171,21 +169,20 @@ def run_system_diagnostic() -> str:
     try:
         from monitor import get_system_metrics
         m = get_system_metrics()
-        
-        status = "🟢 NOMINAL" if m['cpu'] < 80 and m['ram'] < 90 else "🔴 STRESSED"
-        
-        report = f"--- 🖥️ SYSTEM HEALTH: {status} ---\n"
-        report += f"🚀 CPU: {m['cpu']}%\n"
-        report += f"🧠 RAM: {m['ram']}%\n"
-        report += f"💾 DISK: {m['disk']}%\n"
-        report += "\n📡 PORT STATUS:\n"
+
+        status = "NOMINAL" if m['cpu'] < 80 and m['ram'] < 90 else "STRESSED"
+
+        report = f"--- SYSTEM HEALTH: {status} ---\n"
+        report += f"CPU: {m['cpu']}%\n"
+        report += f"RAM: {m['ram']}%\n"
+        report += f"DISK: {m['disk']}%\n"
+        report += "\nPORT STATUS:\n"
         for port, state in m.get('ports', {}).items():
-            icon = "✅" if state == "OPEN" else "❌"
-            report += f" - {port}: {state} {icon}\n"
+            report += f" - {port}: {state}\n"
         report += "--- END DIAGNOSTIC ---"
         return report
     except Exception as e:
-        return f"❌ Diagnostic Error: {e}"
+        return f"Diagnostic Error: {e}"
 
 
 # --- TOOL 7: THE CODE ARCHITECT ---
@@ -194,80 +191,150 @@ def review_code(code: str) -> str:
     try:
         from monitor import log_activity
         log_activity("Code Architect", "Code Analysis Triggered", "Info", f"Snippet length: {len(code)}")
-        
-        # This is a specialized system prompt for code analysis
-        # In a real tool, this would be a specific LLM call, but here we provide a structured template
-        # that the Agent can populate when it uses the 'execute_python_code' or handles text.
-        # But wait, the Agent is the one calling this tool. The tool itself should provide
-        # a checklist or a framework for the Agent to use.
-        
+
         analysis_framework = """
---- 🏗️ CODE ARCHITECT REVIEW ---
-1. 🔐 **SECURITY**: No hardcoded keys, no unsafe exec(user_input), robust validation.
-2. 🚀 **PERFORMANCE**: Optimized loops, proper resource closing, efficient algorithms.
-3. 🧹 **READABILITY**: PEP8 compliance, clear variable naming, modular structure.
-4. 💡 **VERDICT**: [PASS/WARN/FAIL]
+--- CODE ARCHITECT REVIEW ---
+1. SECURITY: No hardcoded keys, no unsafe exec(user_input), robust validation.
+2. PERFORMANCE: Optimized loops, proper resource closing, efficient algorithms.
+3. READABILITY: PEP8 compliance, clear variable naming, modular structure.
+4. VERDICT: [PASS/WARN/FAIL]
 --- END REVIEW ---
 """
-        return f"✅ Analysis Framework Loaded.\n{analysis_framework}\n\n[VICTOR]: Send me your code snippet and I will apply this framework immediately."
+        return f"Analysis Framework Loaded.\n{analysis_framework}\n\n[VICTOR]: Send me your code snippet and I will apply this framework immediately."
     except Exception as e:
-        return f"❌ Code Review Error: {e}"
+        return f"Code Review Error: {e}"
 
 # --- TOOL 8: THE EYE (Vision) ---
 def capture_screen() -> str:
     """Takes a high-resolution screenshot of the primary monitor."""
     try:
-        workspace_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
-        if not os.path.exists(workspace_dir):
-            os.makedirs(workspace_dir)
-            
+        workspace_dir = cfg.workspace_dir
+        os.makedirs(workspace_dir, exist_ok=True)
+
         screenshot_path = os.path.join(workspace_dir, "screen_capture.png")
-        
-        # Take the screenshot
         screenshot = pyautogui.screenshot()
         screenshot.save(screenshot_path)
-        
+
         return os.path.abspath(screenshot_path)
     except Exception as e:
-        return f"❌ Vision Error: {e}"
+        return f"Vision Error: {e}"
 
 # --- TOOL 9: THE BACKUP (GitHub) ---
 def push_to_github(commit_message: str) -> str:
     """Commits all changes and pushes to the configured GitHub repository."""
     try:
         import subprocess
-        
-        # 1. Check if git is initialized
+
         if not os.path.exists(".git"):
             subprocess.run(["git", "init"], check=True)
-            
-        # 2. Add all files
+
         subprocess.run(["git", "add", "."], check=True)
-        
-        # 3. Commit
-        # Check if there are changes to commit first to avoid error
+
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
         if not status.stdout.strip():
-            return "✅ No changes to commit."
-            
+            return "No changes to commit."
+
         subprocess.run(["git", "commit", "-m", commit_message], check=True)
-        
-        # 4. Push
-        # Check for remote
+
         remote = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
         if "origin" not in remote.stdout:
-            return "⚠️ Git committed locally, but NO REMOTE configured. Please set 'origin' using: git remote add origin <URL>"
-            
-        push_result = subprocess.run(["git", "push", "-u", "origin", "main"], capture_output=True, text=True) # Try main first
+            return "Git committed locally, but NO REMOTE configured. Please set 'origin' using: git remote add origin <URL>"
+
+        push_result = subprocess.run(["git", "push", "-u", "origin", "main"], capture_output=True, text=True)
         if push_result.returncode != 0:
-             # Fallback to master if main fails (common legacy issue)
              push_result = subprocess.run(["git", "push", "-u", "origin", "master"], capture_output=True, text=True)
-             
+
         if push_result.returncode == 0:
-            return "✅ Successfully pushed to GitHub!"
+            return "Successfully pushed to GitHub!"
         else:
-            return f"❌ Push failed: {push_result.stderr}"
+            return f"Push failed: {push_result.stderr}"
 
     except Exception as e:
-        return f"❌ Git Error: {e}"
+        return f"Git Error: {e}"
 
+
+# ==========================================
+# TASK QUEUE & WORKFLOW TOOLS
+# ==========================================
+
+def submit_task(task_type: str, description: str, priority: int = 3) -> str:
+    """Submits an async task to the Victor-OS task queue for background processing.
+    Use this for long-running operations that shouldn't block the conversation."""
+    from task_queue import TaskQueue
+    queue = TaskQueue()
+    task_id = queue.enqueue(
+        task_type=task_type,
+        payload={"description": description},
+        priority=priority,
+    )
+    return f"Task submitted (ID: {task_id}). I will notify you when it completes."
+
+
+def check_task_status(task_id: str) -> str:
+    """Checks the status of a previously submitted background task."""
+    from task_queue import TaskQueue
+    queue = TaskQueue()
+    task = queue.get_task(task_id)
+    if not task:
+        return f"No task found with ID: {task_id}"
+    return (
+        f"Task {task.id}: {task.status.value}\n"
+        f"Type: {task.task_type}\n"
+        f"Progress: {task.progress}%\n"
+        f"Result: {task.result or 'Pending'}"
+    )
+
+
+def run_workflow(workflow_name: str) -> str:
+    """Triggers a named workflow for execution. Workflows are multi-step automation pipelines."""
+    from workflow_engine import WorkflowEngine
+    from skills.ops_health_check import OpsHealthCheckSkill
+    from skills.market_watch import MarketWatchSkill
+    from skills.memory_hygiene import MemoryHygieneSkill
+    engine = WorkflowEngine()
+    engine.load_definitions_from_dir()
+    ops = OpsHealthCheckSkill()
+    market = MarketWatchSkill()
+    memory_hygiene = MemoryHygieneSkill()
+
+    def _action_ops_health_summary(params, context):
+        return ops.tool_ops_health_summary()
+
+    def _action_market_snapshot(params, context):
+        return market.tool_market_snapshot()
+
+    def _action_memory_hygiene(params, context):
+        return memory_hygiene.tool_memory_hygiene_report()
+
+    def _action_compose_daily_ops_report(params, context):
+        health = params.get("health") or context.get("step_collect_ops_health_result", "")
+        return "Daily Ops Brief\n\n" + str(health)
+
+    def _action_notify(params, context):
+        return str(params.get("message", "Notification sent."))
+
+    engine.register_action("ops_health_summary", _action_ops_health_summary)
+    engine.register_action("market_snapshot", _action_market_snapshot)
+    engine.register_action("memory_hygiene", _action_memory_hygiene)
+    engine.register_action("compose_daily_ops_report", _action_compose_daily_ops_report)
+    engine.register_action("notify", _action_notify)
+    try:
+        run = engine.execute(workflow_name)
+        steps_summary = ", ".join(
+            f"{sr['step']}:{sr['status']}" for sr in run.step_results
+        )
+        return f"Workflow '{workflow_name}' {run.status}. Steps: {steps_summary}"
+    except ValueError as e:
+        return f"Workflow error: {e}"
+
+
+def list_workflows() -> str:
+    """Lists all available workflows that can be triggered."""
+    from workflow_engine import WorkflowEngine
+    engine = WorkflowEngine()
+    engine.load_definitions_from_dir()
+    workflows = engine.get_available_workflows()
+    if not workflows:
+        return "No workflows defined. Add .json files to victor_os/workflows/"
+    lines = [f"- {w['name']}: {w['description']} (trigger: {w['trigger']})" for w in workflows]
+    return "Available workflows:\n" + "\n".join(lines)
