@@ -4,6 +4,9 @@ import sys
 import json
 import re
 import sqlite3
+import glob
+import tempfile
+import time
 from typing import Any
 from tendo import singleton
 
@@ -41,19 +44,57 @@ def _resolve_runtime_path(path_text):
         return path_text
     return os.path.join(BASE_DIR, path_text)
 
+def _has_live_telegram_process() -> bool:
+    try:
+        import psutil
+
+        current = os.getpid()
+        for proc in psutil.process_iter(["pid", "cmdline", "name"]):
+            if proc.info.get("pid") == current:
+                continue
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            if "telegram_server.py" in cmd:
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _cleanup_stale_singleton_lock():
+    temp_dir = tempfile.gettempdir()
+    patterns = [
+        os.path.join(temp_dir, "*telegram_server-.lock"),
+        os.path.join(temp_dir, "*telegram_server*lock*"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+            except Exception:
+                continue
+
+
 # --- SINGLETON LOCK (Prevent Duplicate Instances) ---
 try:
     me = singleton.SingleInstance()
 except singleton.SingleInstanceException:
-    logger.warning("Singleton lock — another instance running. Exiting.")
-    sys.exit(0)
+    if not _has_live_telegram_process():
+        _cleanup_stale_singleton_lock()
+        try:
+            me = singleton.SingleInstance()
+        except singleton.SingleInstanceException:
+            logger.warning("Singleton lock detected and could not be recovered. Exiting.")
+            sys.exit(0)
+    else:
+        logger.warning("Singleton lock — another instance running. Exiting.")
+        sys.exit(0)
 
 logger.info("Telegram server starting up")
 
 from google.adk import Runner
 from google.genai import types
 from agents import chief_of_staff, get_skill_registry
-from tools import transcribe_audio_file, generate_tts_file
+from tools import transcribe_audio_file, generate_tts_file, send_email_alert
 from monitor import log_activity
 from memory_core import MemoryQueryInput, MemoryRecordInput, recall_memory, save_memory
 from memory_policy import classify_memory_candidate, redact_sensitive
@@ -81,14 +122,68 @@ from task_queue import TaskQueue
 
 _task_queue = TaskQueue()
 
+def _extract_send_file_marker(text: str) -> tuple[str | None, str]:
+    msg = str(text or "")
+    file_match = re.search(r"<<SEND_FILE:\s*(.*?)>>", msg)
+    if not file_match:
+        return None, msg.strip()
+    raw_path = file_match.group(1).strip()
+    clean_message = msg.replace(file_match.group(0), "").strip()
+    return raw_path, clean_message
+
+
 def _notify_user_telegram(user_id, channel, message):
     """Push task/proactive notifications to Telegram."""
     try:
-        target = str(user_id or "").strip() if channel == "telegram" and str(user_id or "").strip() else cfg.telegram_target_id
-        if target:
-            telegram_breaker.call(bot.send_message, target, message)
+        user_target = str(user_id or "").strip()
+        target = cfg.telegram_target_id
+        if channel == "telegram" and user_target.isdigit():
+            target = user_target
+        if not target:
+            return
+        raw_file, clean_message = _extract_send_file_marker(str(message))
+        if clean_message:
+            telegram_breaker.call(bot.send_message, target, clean_message)
+        if raw_file:
+            resolved_path = _resolve_runtime_path(raw_file)
+            if os.path.exists(resolved_path):
+                sent = False
+                send_error = None
+                for attempt in range(3):
+                    try:
+                        with open(resolved_path, "rb") as doc:
+                            telegram_breaker.call(bot.send_document, target, doc)
+                        sent = True
+                        break
+                    except Exception as e:
+                        send_error = e
+                        time.sleep(1.0 + attempt)
+                if not sent:
+                    size_mb = os.path.getsize(resolved_path) / (1024 * 1024)
+                    fallback = (
+                        "Output file is ready but Telegram upload failed after retries.\n"
+                        f"File: {os.path.basename(resolved_path)} ({size_mb:.2f} MB)\n"
+                        f"Local path: {resolved_path}\n"
+                        f"Error: {send_error}"
+                    )
+                    telegram_breaker.call(bot.send_message, target, fallback)
+            else:
+                telegram_breaker.call(bot.send_message, target, f"Courier Error: File not found at {raw_file}")
     except Exception as e:
         logger.error(f"Notification push failed: {e}")
+
+def _notify_user_email(user_id, channel, message):
+    """Email-only proactive notifier for serious alerts."""
+    try:
+        subject = "Critical Victor-OS Alert"
+        body = (
+            f"Channel: {channel}\n"
+            f"User: {user_id}\n\n"
+            f"{message}"
+        )
+        send_email_alert(subject, body)
+    except Exception as e:
+        logger.error(f"Email notification failed: {e}")
 
 
 def _notify_user_whatsapp(user_id, message):
@@ -109,6 +204,12 @@ def _notify_user_whatsapp(user_id, message):
     except Exception as e:
         logger.warning(f"WhatsApp fanout failed: {e}")
 
+try:
+    from invoice_pipeline import run_invoice_job
+    _task_queue.register_handler("invoice_job", run_invoice_job)
+except Exception as e:
+    logger.warning(f"Invoice pipeline handler unavailable: {e}")
+
 _task_queue.set_notify_callback(_notify_user_telegram)
 _task_queue.start_worker()
 
@@ -119,13 +220,90 @@ try:
     if _skill_registry and cfg.proactive_enabled:
         _proactive = ProactiveEngine()
         _proactive.register_checks_from_registry(_skill_registry.get_proactive_checks())
+
+        # Register memory TTL cleanup as a proactive check
+        try:
+            from memory_cleanup import get_proactive_check as _get_mem_cleanup_check
+            _proactive.register_checks_from_registry([_get_mem_cleanup_check()])
+            logger.info("Memory TTL cleanup registered with proactive engine (hourly)")
+        except Exception as _mc_err:
+            logger.warning(f"Memory cleanup proactive check not registered: {_mc_err}")
+
         _proactive.set_notify_callback(_notify_user_telegram)
         _proactive.add_channel_notifier("telegram", lambda user_id, message: _notify_user_telegram(user_id, "telegram", message))
-        _proactive.add_channel_notifier("whatsapp", _notify_user_whatsapp)
+        _proactive.add_channel_notifier("email", lambda user_id, message: _notify_user_email(user_id, "email", message))
         _proactive.start()
-        logger.info("Proactive engine started")
+        logger.info("Proactive engine started with telegram + email channels")
 except Exception as e:
     logger.warning(f"Proactive engine not started: {e}")
+
+# Start workflow scheduler for trigger-based workflows
+try:
+    from workflow_engine import WorkflowEngine, WorkflowScheduler
+    _wf_engine = WorkflowEngine()
+    _wf_engine.load_definitions_from_dir()
+
+    # Register daily briefing action handlers so ops_daily_brief.json runs via scheduler
+    try:
+        from skills.ops_health_check import OpsHealthCheckSkill as _OpsSkill
+        from skills.market_watch import MarketWatchSkill as _MarketSkill
+        from skills.memory_hygiene import MemoryHygieneSkill as _MemHygieneSkill
+
+        _ops_skill = _OpsSkill()
+        _market_skill = _MarketSkill()
+        _mem_hygiene_skill = _MemHygieneSkill()
+
+        _wf_engine.register_action("ops_health_summary", lambda params, ctx: _ops_skill.tool_ops_health_summary())
+        _wf_engine.register_action("market_snapshot", lambda params, ctx: _market_skill.tool_market_snapshot())
+        _wf_engine.register_action("memory_hygiene", lambda params, ctx: _mem_hygiene_skill.tool_memory_hygiene_report())
+
+        def _compose_daily_report(params, ctx):
+            """Run Chief through ADK to compose the daily briefing."""
+            _brief_msg = types.Content(role="user", parts=[types.Part(text=(
+                "MORNING BRIEFING TASK:\n"
+                "1. Research the current price of Bitcoin and Ethereum.\n"
+                "2. Find one major AI headline in the last 24 hours.\n"
+                "3. Find one key business headline from Lagos, Nigeria.\n"
+                "Return a concise executive report."
+            ))])
+            _chunks = []
+            for _ev in gemini_breaker.call(runner.run, user_id="briefing_system", session_id="daily_briefing_session", new_message=_brief_msg):
+                _chunks.extend(_extract_text_from_node(_ev))
+            return "Victor-OS Morning Briefing\n\n" + ("\n".join(_unique_text_chunks(_chunks)) or "Morning briefing returned no content.")
+
+        _wf_engine.register_action("compose_daily_ops_report", _compose_daily_report)
+        logger.info("Daily briefing action handlers registered with workflow scheduler")
+    except Exception as _db_err:
+        logger.warning(f"Daily briefing action handlers not registered: {_db_err}")
+
+    # Register action handlers for goal review workflow
+    try:
+        from goal_tracker import get_goal_tracker as _get_gt
+        _gt = _get_gt()
+        _wf_engine.register_action("list_active_goals", lambda params, ctx: "\n".join(
+            f"- [{g.status}] {g.title} (P{g.priority}, {g.progress}%)" for g in _gt.list_goals(status_filter="active")
+        ) or "No active goals.")
+        _wf_engine.register_action("check_overdue_goals", lambda params, ctx: "\n".join(
+            f"- OVERDUE: {g.title} (P{g.priority})" for g in _gt.get_overdue_goals()
+        ) or "No overdue goals.")
+        _wf_engine.register_action("format_goal_review", lambda params, ctx: (
+            "Weekly Goal Review\n\n"
+            f"Active Goals:\n{ctx.get('step_list_active_result', 'None')}\n\n"
+            f"Overdue:\n{ctx.get('step_check_overdue_result', 'None')}"
+        ))
+    except Exception as e:
+        logger.debug(f"Goal workflow actions not registered: {e}")
+
+    # Register notify action
+    _wf_engine.register_action("notify", lambda params, ctx: str(params.get("message", "Notification sent.")))
+
+    _wf_scheduler = WorkflowScheduler(
+        engine=_wf_engine,
+        notify_callback=_notify_user_telegram,
+    )
+    _wf_scheduler.start()
+except Exception as e:
+    logger.warning(f"Workflow scheduler not started: {e}")
 
 
 @bot.message_handler(commands=['start', 'help'])
@@ -317,12 +495,68 @@ def _sanitize_history_line(role, text):
     return text
 
 
-def _build_session_context(user_id: str, limit: int = 16) -> str:
+def _strip_injected_context(text: str) -> str:
+    """Remove our injected memory wrapper to prevent recursive prompt explosion."""
+    if not text:
+        return ""
+    idx = text.rfind("USER:")
+    if idx >= 0:
+        text = text[idx + len("USER:") :]
+    text = text.replace("RULE: Use these contexts. Do not claim lack of memory without checking these blocks.", "")
+    text = re.sub(r"=== MEMORY FABRIC V3 ===.*?========================", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+def _compact_text(text: str, max_chars: int = 360) -> str:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return text[:max_chars]
+
+
+def _sanitize_model_reply(text: str) -> str:
+    """Guardrail in runtime output in case delegated agents break persona."""
+    if not text:
+        return text
+    lowered = text.lower()
+    blocked = [
+        "as a large language model",
+        "i do not possess memory in the human sense",
+        "i don't store information from previous conversations",
+        "i do not have any persistent memory",
+    ]
+    if any(b in lowered for b in blocked):
+        return (
+            "I maintain continuity using your active session context and long-term vault records. "
+            "If you want, I can give you an immediate executive sitrep of what I currently retain."
+        )
+    return text
+
+
+def _is_transient_network_error(exc: Exception) -> bool:
+    lowered = repr(exc).lower()
+    return any(
+        marker in lowered
+        for marker in [
+            "connectionreseterror",
+            "connection aborted",
+            "winerror 10054",
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+        ]
+    )
+
+
+def _build_session_context(session_ids: list[str], limit: int = 10) -> str:
     history_context = ""
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT event_data FROM events WHERE session_id=? ORDER BY timestamp DESC LIMIT ?", (user_id, limit * 2))
+        placeholders = ",".join("?" * len(session_ids))
+        params = list(session_ids) + [limit * 4]
+        cursor.execute(
+            f"SELECT event_data FROM events WHERE session_id IN ({placeholders}) ORDER BY timestamp DESC LIMIT ?",
+            params,
+        )
         rows = cursor.fetchall()
         messages = []
         for row in rows:
@@ -335,10 +569,12 @@ def _build_session_context(user_id: str, limit: int = 16) -> str:
                     for part in data["content"]["parts"]:
                         if "text" in part:
                             text += part["text"]
+                    if role == "user":
+                        text = _strip_injected_context(text)
                     text = _sanitize_history_line(role, text)
                     if text:
                         label = "User" if role == "user" else "Victor"
-                        messages.append(f"{label}: {text}")
+                        messages.append(f"{label}: {_compact_text(text)}")
             except Exception:
                 continue
         conn.close()
@@ -549,6 +785,22 @@ def handle_document(message):
         with open(file_path, 'wb') as new_file:
             new_file.write(downloaded_file)
 
+        file_ext = os.path.splitext(file_name)[1].lower().lstrip(".")
+        invoice_mode = cfg.invoice_job_enabled and (
+            file_ext == "zip" or file_ext in set(cfg.invoice_allowed_exts)
+        )
+        if invoice_mode:
+            from invoice_pipeline import enqueue_invoice_job
+            task_id = enqueue_invoice_job(file_path, channel="telegram", user_id=user_id)
+            bot.reply_to(
+                message,
+                (
+                    f"Invoice job queued (ID: {task_id}). "
+                    "I will return a zipped output with artifacts/OK and artifacts/Review when complete."
+                ),
+            )
+            return
+
         system_note = f"User uploaded a file available at: {file_path}. Use Python to read/analyze it if requested."
         user_text = message.caption if message.caption else f"I've uploaded {file_name}."
         combined_text = f"{user_text}\n\n[SYSTEM NOTE: {system_note}]"
@@ -568,12 +820,31 @@ def process_message(message, user_text, image_data=None):
     cid = new_correlation_id()
     user_id = str(message.chat.id)
     logger.info(f"Processing: {user_text[:80]}{'...' if len(user_text) > 80 else ''} {'(with image)' if image_data else ''}", extra={"channel": "telegram", "user_id": user_id})
-    bot.send_chat_action(message.chat.id, 'typing')
+    try:
+        telegram_breaker.call(bot.send_chat_action, message.chat.id, 'typing')
+    except Exception as e:
+        logger.warning(f"Typing indicator failed: {e}", extra={"channel": "telegram", "user_id": user_id})
     log_activity("Telegram User", "Input Received", "Info", f"Text: {user_text[:50]}...")
 
     try:
+        lower_text = (user_text or "").strip().lower()
+        folder_intent = (
+            ("folder" in lower_text or "folders" in lower_text)
+            and any(k in lower_text for k in ["can you", "do you", "take", "accept", "support", "process"])
+        )
+        if folder_intent and cfg.invoice_job_enabled:
+            quick_reply = (
+                "Yes. I support folder processing in zip mode.\n"
+                "Send one .zip file containing your documents and I will process it as a background invoice job.\n"
+                "You will receive an output zip with `artifacts/OK`, `artifacts/Review`, `summary.json`, "
+                "`review_items.json`, and `run.log`."
+            )
+            send_smart_message(message.chat.id, quick_reply, reply_to_id=message)
+            return
+
         # 1. Prepare Content Object
-        history_context = _build_session_context(user_id)
+        resolved_sid = resolve_session_id("telegram", user_id)
+        history_context = _build_session_context([resolved_sid, user_id])
         memory_context = _build_memory_context(user_text)
         global_block = _format_hits_block("GLOBAL_CONTEXT", memory_context["global_hits"])
         agent_block = _format_hits_block("AGENT_CONTEXT", memory_context["agent_hits"])
@@ -608,33 +879,43 @@ def process_message(message, user_text, image_data=None):
 
         # 2. Start the Stream
         resolved_uid = resolve_user_id("telegram", user_id)
-        resolved_sid = resolve_session_id("telegram", user_id)
-
-        event_stream = runner.run(
-            user_id=resolved_uid,
-            session_id=resolved_sid,
-            new_message=new_message
-        )
 
         final_answer = ""
         tool_names = []
         delegated_agents = []
+        stream_error = None
+        for attempt in range(2):
+            try:
+                event_stream = gemini_breaker.call(
+                    runner.run,
+                    user_id=resolved_uid,
+                    session_id=resolved_sid,
+                    new_message=new_message
+                )
+                for event in event_stream:
+                    detected_tools = _extract_tool_names_from_node(event)
+                    if detected_tools:
+                        tool_names.extend(detected_tools)
+                    author_name = getattr(event, "author", None)
+                    if isinstance(author_name, str) and author_name and author_name != "Chief_of_Staff":
+                        delegated_agents.append(author_name)
 
-        try:
-            for event in event_stream:
-                detected_tools = _extract_tool_names_from_node(event)
-                if detected_tools:
-                    tool_names.extend(detected_tools)
-                author_name = getattr(event, "author", None)
-                if isinstance(author_name, str) and author_name and author_name != "Chief_of_Staff":
-                    delegated_agents.append(author_name)
-
-                text_chunks = _unique_text_chunks(_extract_text_from_node(event))
-                if text_chunks:
-                    final_answer += "".join(text_chunks)
-
-        except Exception as e:
-            logger.error(f"Event loop failed: {e}", extra={"channel": "telegram", "user_id": user_id})
+                    text_chunks = _unique_text_chunks(_extract_text_from_node(event))
+                    if text_chunks:
+                        final_answer += "".join(text_chunks)
+                stream_error = None
+                break
+            except Exception as e:
+                stream_error = e
+                if attempt == 0 and _is_transient_network_error(e):
+                    logger.warning(
+                        f"Transient stream error; retrying once: {e}",
+                        extra={"channel": "telegram", "user_id": user_id},
+                    )
+                    time.sleep(1.0)
+                    continue
+                logger.error(f"Event loop failed: {e}", extra={"channel": "telegram", "user_id": user_id})
+                break
 
         # 3. Decision: Text or Voice Reply?
         should_speak = "speak" in user_text.lower() or "say" in user_text.lower()
@@ -643,13 +924,53 @@ def process_message(message, user_text, image_data=None):
         unique_tools = _unique_text_chunks(tool_names)
         delegated_agents = _unique_text_chunks(delegated_agents)
         if not final_answer.strip():
-            if unique_tools:
+            if stream_error is not None:
+                final_answer = "I hit a temporary network issue while processing your request. Please resend once."
+            elif unique_tools:
                 tool_summary = ", ".join(unique_tools[:3])
                 final_answer = f"Completed your request using: {tool_summary}. If you want, I can provide a concise result summary next."
             else:
                 final_answer = "I received your input, but I was unable to generate a response. Please check the system logs."
 
+        final_answer = _sanitize_model_reply(final_answer)
+
+        # --- CRITIC LAYER ---
+        if cfg.critic_enabled:
+            try:
+                from critic import get_critic
+                verdict = get_critic().evaluate(user_text, final_answer)
+                if verdict.revised_response:
+                    logger.info(
+                        f"Critic revised response: score={verdict.score}, issues={verdict.issues}",
+                        extra={"channel": "telegram", "user_id": user_id},
+                    )
+                    final_answer = verdict.revised_response
+                else:
+                    logger.debug(
+                        f"Critic approved: score={verdict.score}",
+                        extra={"channel": "telegram", "user_id": user_id},
+                    )
+            except Exception as e:
+                logger.warning(f"Critic evaluation failed (fail-open): {e}")
+
         _save_deterministic_memories(user_text, final_answer, unique_tools, delegated_agents)
+
+        # --- GOAL AUTO-DETECTION ---
+        if cfg.goals_auto_detect:
+            try:
+                from goal_tracker import get_goal_tracker
+                _goal_tracker = get_goal_tracker()
+                candidates = _goal_tracker.detect_goals_from_text(user_text, final_answer)
+                for candidate in candidates:
+                    gid = _goal_tracker.create_goal(
+                        title=candidate.title,
+                        description=candidate.description,
+                        priority=candidate.priority,
+                        source="auto_detected",
+                    )
+                    logger.info(f"Auto-detected goal: {gid} '{candidate.title}'", extra={"channel": "telegram"})
+            except Exception as e:
+                logger.warning(f"Goal auto-detection failed: {e}")
 
         if should_speak:
             logger.info("Generating voice response", extra={"channel": "telegram", "user_id": user_id})
@@ -688,7 +1009,11 @@ def process_message(message, user_text, image_data=None):
 
     except Exception as e:
         logger.error(f"Processing error: {e}", extra={"channel": "telegram", "user_id": user_id})
-        bot.reply_to(message, f"System Error: {e}")
+        send_smart_message(
+            message.chat.id,
+            "I hit a temporary processing issue. Please resend your last message.",
+            reply_to_id=message,
+        )
         log_activity("System", "Error", "Failed", str(e))
 
 bot.infinity_polling(timeout=60, long_polling_timeout=60)

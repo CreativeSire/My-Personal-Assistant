@@ -1,0 +1,22 @@
+14:31:57 [INFO] victor_os.telegram_server: Telegram server starting up
+14:32:05 [INFO] victor_os.memory_core: Memory vault initialized
+14:32:05 [INFO] victor_os.skill_registry: Registered skill: goal_tracking v1.0.0 (4 tools)
+14:32:05 [INFO] victor_os.skill_registry: Registered skill: market_watch v1.0.0 (1 tools)
+14:32:05 [INFO] victor_os.skill_registry: Registered skill: memory_hygiene v1.0.0 (1 tools)
+14:32:05 [INFO] victor_os.skill_registry: Registered skill: ops_health_check v1.0.0 (1 tools)
+14:32:05 [INFO] victor_os.skill_registry: Loaded 4 skill(s) from C:\Users\HomePC\Desktop\My Personal Assistant\victor_os\skills
+14:32:05 [INFO] victor_os.telegram_server: Connecting to Telegram...
+14:32:05 [INFO] victor_os.telegram_server: Victor-OS (Multimodal Mode) is Online! (Bot ID: 7770925936)
+14:32:06 [INFO] victor_os.task_queue: Registered task handler: invoice_job
+14:32:06 [INFO] victor_os.task_queue: Task queue worker started
+14:32:06 [INFO] victor_os.proactive_engine: Registered 5 proactive checks
+14:32:06 [INFO] victor_os.proactive_engine: Registered 6 proactive checks
+14:32:06 [INFO] victor_os.telegram_server: Memory TTL cleanup registered with proactive engine (hourly)
+14:32:06 [INFO] victor_os.proactive_engine: Proactive engine started
+14:32:06 [INFO] victor_os.telegram_server: Proactive engine started with telegram + email channels
+14:32:06 [INFO] victor_os.workflow_engine: Loaded 5 workflow definition(s)
+14:32:06 [INFO] victor_os.telegram_server: Daily briefing action handlers registered with workflow scheduler
+14:32:06 [INFO] victor_os.workflow_engine: Scheduled workflow 'goal_weekly_review' every sunday at 18:00
+14:32:06 [INFO] victor_os.workflow_engine: Scheduled workflow 'ops_daily_brief' daily at 08:00
+14:32:06 [INFO] victor_os.workflow_engine: Workflow scheduler started with 2 job(s)
+14:32:09 [INFO] victor_os.proactive_engine: Proactive check 'ops_health_threshold' buffered critical streak=1

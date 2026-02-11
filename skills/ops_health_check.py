@@ -3,12 +3,14 @@ import os
 import sqlite3
 from typing import Callable
 
+from config import get_config
 from monitor import get_system_metrics
 from skill_base import Skill, SkillManifest
 
 
 class OpsHealthCheckSkill(Skill):
     def __init__(self):
+        self._cfg = get_config()
         self._task_db = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "memory_store", "victor_tasks.db")
 
     def manifest(self) -> SkillManifest:
@@ -52,10 +54,16 @@ class OpsHealthCheckSkill(Skill):
             cpu = float(metrics.get("cpu", 0))
             ram = float(metrics.get("ram", 0))
             disk = float(metrics.get("disk", 0))
-            if cpu >= 85 or ram >= 90 or disk >= 92 or depth >= 8:
+            critical = (
+                ram >= float(self._cfg.critical_ram_threshold)
+                or disk >= float(self._cfg.critical_disk_threshold)
+                or depth >= float(self._cfg.critical_queue_depth_threshold)
+            )
+            if critical:
                 return json.dumps(
                     {
                         "alert": "ops_health_threshold",
+                        "severity": "critical",
                         "cpu": cpu,
                         "ram": ram,
                         "disk": disk,

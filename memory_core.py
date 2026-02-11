@@ -10,22 +10,28 @@ from typing import Any, Optional
 
 import numpy as np
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
 from google.genai import Client
 
+from config import get_config
+from logging_config import get_logger, setup_logging
+from resilience import retry_with_backoff, gemini_breaker
 
-load_dotenv()
+cfg = get_config()
+logger = get_logger("memory_core")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "memory_store", "victor_vault.db")
-VECTORS_DIR = os.path.join(BASE_DIR, "memory_store", "victor_brain_vectors")
-EMBEDDING_MODEL = "models/gemini-embedding-001"
-FERNET_KEY_ENV = "VICTOR_MEMORY_KEY"
+# Initialize logging
+setup_logging(cfg.log_dir)
+
+BASE_DIR = cfg.base_dir
+DB_PATH = cfg.vault_db_path
+VECTORS_DIR = cfg.vectors_dir
+EMBEDDING_MODEL = cfg.embedding_model
+FERNET_KEY_ENV = cfg.fernet_key_env
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(VECTORS_DIR, exist_ok=True)
 
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = cfg.gemini_api_key or cfg.google_api_key
 client = Client(api_key=api_key)
 
 
@@ -202,6 +208,7 @@ def init_db():
     try:
         _create_base_table(conn)
         _migrate_schema(conn)
+        logger.info("Memory vault initialized")
     finally:
         conn.close()
 
@@ -209,13 +216,19 @@ def init_db():
 init_db()
 
 
+@retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=15.0)
+def _embed_with_retry(text: str):
+    """Call Gemini embedding API with retry."""
+    return client.models.embed_content(model=EMBEDDING_MODEL, contents=text)
+
+
 def get_embedding(text: str):
-    """Uses Gemini to get vector embeddings."""
+    """Uses Gemini to get vector embeddings with retry and circuit breaker."""
     try:
-        response = client.models.embed_content(model=EMBEDDING_MODEL, contents=text)
+        response = gemini_breaker.call(_embed_with_retry, text)
         return response.embeddings[0].values
     except Exception as e:
-        print(f"Embedding Error: {e}")
+        logger.error(f"Embedding failed: {e}", extra={"tool_name": "get_embedding"})
         return None
 
 
@@ -274,6 +287,7 @@ def save_memory(record: MemoryRecordInput) -> dict[str, Any]:
                 (now, priority, record.source, json.dumps(merged_meta), record.ttl_at, content_cipher, existing["id"]),
             )
             conn.commit()
+            logger.info(f"Memory dedup-merged: {existing['id']}", extra={"agent_name": "memory_core"})
             return {"ok": True, "status": "dedup_merged", "id": existing["id"], "memory_type": memory_type, "scope": scope}
 
         clean_type = memory_type.replace(" ", "_")
@@ -310,6 +324,7 @@ def save_memory(record: MemoryRecordInput) -> dict[str, Any]:
         conn.commit()
         with open(os.path.join(VECTORS_DIR, "vault_status.txt"), "w", encoding="utf-8") as f:
             f.write(f"Vault write at {now}")
+        logger.info(f"Memory inserted: {doc_id}", extra={"agent_name": "memory_core"})
         return {"ok": True, "status": "inserted", "id": doc_id, "memory_type": memory_type, "scope": scope}
     finally:
         conn.close()
@@ -419,9 +434,9 @@ def save_long_term_memory(text: str, tags: str = "general"):
     result = save_memory(record)
     if result.get("ok"):
         if result.get("status") == "dedup_merged":
-            return f"✅ Memory merged in Vault [{result.get('id')}]"
-        return f"✅ Memory committed to Vault [{result.get('id')}]"
-    return f"❌ Memory save failed: {result.get('reason', 'unknown')}"
+            return f"Memory merged in Vault [{result.get('id')}]"
+        return f"Memory committed to Vault [{result.get('id')}]"
+    return f"Memory save failed: {result.get('reason', 'unknown')}"
 
 
 def recall_long_term_memory(query: str, n_results: int = 5):
@@ -441,7 +456,7 @@ def recall_long_term_memory(query: str, n_results: int = 5):
     if not rows:
         return "No relevant long-term memories found."
     lines = [f"- [{r['memory_type']}/{r['scope']}] {r['content_plain']}" for r in rows]
-    return "🔍 VAULT SEARCH RESULTS:\n" + "\n".join(lines)
+    return "VAULT SEARCH RESULTS:\n" + "\n".join(lines)
 
 
 def save_agent_memory(

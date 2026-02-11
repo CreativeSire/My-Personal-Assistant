@@ -1,4 +1,5 @@
 import hashlib
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -29,8 +30,10 @@ class ProactiveEngine:
         self._checks: list[ProactiveCheck] = []
         self._notify_callback: Callable[[str, str, str], None] | None = None
         self._channel_notifiers: dict[str, Callable[[str, str], None]] = {}
+        self._cfg = cfg
         self._last_run: dict[str, float] = {}
         self._last_sent_hash_at: dict[str, float] = {}
+        self._critical_streak: dict[str, int] = {}
         self._sent_events: list[float] = []
         self._running = False
         self._thread: threading.Thread | None = None
@@ -82,17 +85,15 @@ class ProactiveEngine:
             return True
 
     def _fanout(self, user_id: str, channel_hint: str, message: str):
+        message = self._format_message(message)
         if not self._can_send(message):
             logger.debug(f"Proactive message dedup/rate-limited: {message[:120]}")
             return
 
-        channels = []
-        if channel_hint:
-            channels.append(channel_hint)
-        # Multi-channel fanout after origin
-        for fallback in ("telegram", "whatsapp"):
-            if fallback not in channels:
-                channels.append(fallback)
+        channels = self._build_channels(channel_hint)
+        if not channels:
+            logger.info("Proactive alert suppressed: no enabled outbound channels")
+            return
 
         sent_any = False
         for channel in channels:
@@ -113,6 +114,88 @@ class ProactiveEngine:
         if sent_any:
             logger.info(f"Proactive alert sent for user={user_id} via channels={channels}")
 
+    def _is_channel_enabled(self, channel: str) -> bool:
+        if channel == "email":
+            return bool(self._cfg.proactive_email_enabled)
+        if channel == "telegram":
+            return bool(self._cfg.proactive_telegram_enabled)
+        if channel == "whatsapp":
+            return bool(self._cfg.whatsapp_enabled)
+        return False
+
+    def _build_channels(self, channel_hint: str | None) -> list[str]:
+        channels: list[str] = []
+        hint = (channel_hint or "").strip().lower()
+        if hint and self._is_channel_enabled(hint):
+            channels.append(hint)
+
+        if self._cfg.notify_fanout_mode == "channel_aware_fanout":
+            for fallback in ("email", "telegram", "whatsapp"):
+                if fallback not in channels and self._is_channel_enabled(fallback):
+                    channels.append(fallback)
+        elif self._cfg.notify_fanout_mode == "email_only":
+            if self._is_channel_enabled("email"):
+                channels = ["email"]
+
+        return channels
+
+    def _normalize_severity(self, value: str | None) -> str:
+        raw = (value or "").strip().lower()
+        if raw in {"critical", "warning", "info"}:
+            return raw
+        return "warning"
+
+    def _format_message(self, message: str) -> str:
+        text = str(message or "").strip()
+        if not text:
+            return text
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return text
+        if not isinstance(parsed, dict):
+            return text
+
+        alert = str(parsed.get("alert", "")).strip()
+        if alert == "ops_health_threshold":
+            cpu = parsed.get("cpu", 0)
+            ram = parsed.get("ram", 0)
+            disk = parsed.get("disk", 0)
+            queue_depth = parsed.get("queue_depth", 0)
+            return (
+                "Ops Health Alert\n"
+                f"- CPU: {cpu}%\n"
+                f"- RAM: {ram}%\n"
+                f"- DISK: {disk}%\n"
+                f"- Queue depth: {queue_depth}\n"
+            )
+        return text
+
+    def _parse_check_output(self, output: str | dict[str, Any]) -> tuple[str, str]:
+        if isinstance(output, dict):
+            payload = output
+            text = json.dumps(payload, ensure_ascii=False)
+        else:
+            text = str(output or "")
+            payload = None
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = None
+        severity = self._normalize_severity((payload or {}).get("severity"))
+        return text, severity
+
+    def _is_sendable_severity(self, severity: str) -> bool:
+        mode = (self._cfg.proactive_severity_mode or "critical_only").lower()
+        if mode == "critical_only":
+            return severity == "critical"
+        if mode == "warning_and_above":
+            return severity in {"critical", "warning"}
+        # "all" or any other value → send everything
+        return severity in {"critical", "warning", "info"}
+
     def _run_once(self):
         now = time.time()
         for check in self._checks:
@@ -123,9 +206,27 @@ class ProactiveEngine:
             try:
                 output = check.callback()
                 if output:
+                    text, severity = self._parse_check_output(output)
+                    if not self._is_sendable_severity(severity):
+                        logger.info(
+                            f"Proactive check '{check.name}' skipped by severity policy: {severity}"
+                        )
+                        continue
+                    if severity == "critical":
+                        streak = self._critical_streak.get(check.name, 0) + 1
+                        self._critical_streak[check.name] = streak
+                        if streak < int(self._cfg.critical_consecutive_failures or 3):
+                            logger.info(
+                                f"Proactive check '{check.name}' buffered critical streak={streak}"
+                            )
+                            continue
+                    else:
+                        self._critical_streak[check.name] = 0
                     user_id = check.user_id or "ceejay"
-                    channel = check.channel_hint or "telegram"
-                    self._fanout(user_id, channel, str(output))
+                    channel = check.channel_hint or "email"
+                    self._fanout(user_id, channel, text)
+                else:
+                    self._critical_streak[check.name] = 0
             except Exception as e:
                 logger.warning(f"Proactive check failed ({check.name}): {e}")
 

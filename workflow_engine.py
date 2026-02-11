@@ -5,10 +5,14 @@ JSON-defined multi-step workflow executor with conditional branching.
 
 import os
 import json
+import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+import schedule as schedule_lib
 
 from logging_config import get_logger
 
@@ -242,3 +246,93 @@ class WorkflowEngine:
             except Exception as e:
                 logger.warning(f"Workflow notification failed: {e}")
         return run
+
+    def get_scheduled_workflows(self) -> list[tuple[str, str]]:
+        """Return (workflow_name, schedule_time) for workflows with schedule triggers."""
+        results = []
+        for wf in self._definitions.values():
+            trigger = wf.trigger or ""
+            # Parse "schedule:HH:MM" or "schedule:dayofweek:HH:MM"
+            if trigger.startswith("schedule:"):
+                results.append((wf.name, trigger))
+        return results
+
+
+class WorkflowScheduler:
+    """Background thread that runs scheduled workflows based on their trigger fields.
+
+    Parses trigger formats:
+      - "schedule:08:00"           → every day at 08:00
+      - "schedule:monday:09:00"    → every monday at 09:00
+      - "schedule:sunday:18:00"    → every sunday at 18:00
+    """
+
+    def __init__(self, engine: WorkflowEngine, notify_callback: Callable[[str, str, str], None] | None = None):
+        self._engine = engine
+        self._notify = notify_callback
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._scheduler = schedule_lib.Scheduler()
+
+    def _parse_and_register(self):
+        """Parse trigger fields from all workflows and register with schedule."""
+        scheduled = self._engine.get_scheduled_workflows()
+        for wf_name, trigger in scheduled:
+            parts = trigger.split(":")
+            # "schedule:HH:MM" → parts = ["schedule", "HH", "MM"]
+            # "schedule:monday:HH:MM" → parts = ["schedule", "monday", "HH", "MM"]
+            if len(parts) == 3:
+                # Daily at HH:MM
+                time_str = f"{parts[1]}:{parts[2]}"
+                self._scheduler.every().day.at(time_str).do(self._run_workflow, wf_name)
+                logger.info(f"Scheduled workflow '{wf_name}' daily at {time_str}")
+            elif len(parts) == 4:
+                # Specific day at HH:MM
+                day = parts[1].lower()
+                time_str = f"{parts[2]}:{parts[3]}"
+                day_job = getattr(self._scheduler.every(), day, None)
+                if day_job:
+                    day_job.at(time_str).do(self._run_workflow, wf_name)
+                    logger.info(f"Scheduled workflow '{wf_name}' every {day} at {time_str}")
+                else:
+                    logger.warning(f"Unknown day '{day}' in trigger for workflow '{wf_name}'")
+
+    def _run_workflow(self, wf_name: str):
+        """Execute a scheduled workflow."""
+        try:
+            logger.info(f"Scheduled workflow '{wf_name}' starting")
+            run = self._engine.execute(wf_name)
+            if self._notify and run.status == "completed":
+                result = run.context.get(f"step_notify_user_result") or run.context.get("step_format_review_result") or f"Workflow '{wf_name}' completed."
+                self._notify("ceejay", "telegram", str(result))
+            elif self._notify and run.status == "failed":
+                self._notify("ceejay", "telegram", f"Scheduled workflow '{wf_name}' failed.")
+        except Exception as e:
+            logger.error(f"Scheduled workflow '{wf_name}' error: {e}")
+
+    def _loop(self):
+        while self._running:
+            try:
+                self._scheduler.run_pending()
+            except Exception as e:
+                logger.error(f"Workflow scheduler error: {e}")
+            time.sleep(30)
+
+    def start(self):
+        """Parse triggers and start the scheduler background thread."""
+        if self._running:
+            return
+        self._parse_and_register()
+        if not self._scheduler.get_jobs():
+            logger.info("No scheduled workflows found, scheduler not starting")
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        logger.info(f"Workflow scheduler started with {len(self._scheduler.get_jobs())} job(s)")
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=10)
+        logger.info("Workflow scheduler stopped")

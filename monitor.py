@@ -1,46 +1,32 @@
-import csv
 import os
-import time
-from datetime import datetime
-import psutil # For CPU/RAM usage
+import socket
+import psutil
 
-# --- CONFIGURATION ---
-# Note: These paths are relative to victor_os/ directory if run from there, 
-# or handled via absolute paths for robustness.
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-LOG_FILE = os.path.join(DATA_DIR, "system_logs.csv")
-STATUS_FILE = os.path.join(DATA_DIR, "system_status.json")
+from config import get_config
+from logging_config import get_logger, setup_logging
 
-# Ensure data directory exists
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+cfg = get_config()
+setup_logging(cfg.log_dir)
+logger = get_logger("monitor")
 
-# Initialize Log File if missing
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Agent", "Action", "Status", "Details"])
+DATA_DIR = cfg.data_dir
+LOG_FILE = cfg.log_file
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
 
 def log_activity(agent_name, action, status, details=""):
-    """
-    Logs an event to the CSV database.
-    """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    try:
-        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([timestamp, agent_name, action, status, details])
-        print(f"📝 [LOGGED] {agent_name}: {action} - {status}")
-    except Exception as e:
-        print(f"❌ Logging Error: {e}")
+    """Logs an event via structured logger (backward-compatible signature)."""
+    logger.info(
+        action,
+        extra={"agent_name": agent_name, "details": details},
+    )
 
-import socket
 
-def check_active_ports(ports=[8501, 7777, 3000, 8000]):
-    """
-    Checks if specific ports are open/active.
-    """
+def check_active_ports(ports=None):
+    """Checks if specific ports are open/active."""
+    if ports is None:
+        ports = list(cfg.monitor_ports)
     results = {}
     for port in ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -49,10 +35,9 @@ def check_active_ports(ports=[8501, 7777, 3000, 8000]):
             results[port] = "OPEN" if is_open else "CLOSED"
     return results
 
+
 def get_system_metrics():
-    """
-    Returns live CPU, RAM, and port status for the dashboard.
-    """
+    """Returns live CPU, RAM, and port status for the dashboard."""
     try:
         return {
             "cpu": psutil.cpu_percent(interval=None),
@@ -60,9 +45,9 @@ def get_system_metrics():
             "disk": psutil.disk_usage('/').percent,
             "ports": check_active_ports()
         }
-    except:
+    except Exception:
         return {"cpu": 0, "ram": 0, "disk": 0, "ports": {}}
 
-# Test run
+
 if __name__ == "__main__":
     log_activity("System", "Boot", "Success", "Monitor Initialized")

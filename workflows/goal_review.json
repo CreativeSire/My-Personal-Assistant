@@ -1,0 +1,37 @@
+{
+  "name": "goal_weekly_review",
+  "description": "Weekly review of all active goals with progress summary and overdue alerts",
+  "trigger": "schedule:sunday:18:00",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "list_active",
+      "action": "list_active_goals",
+      "params": {},
+      "timeout_seconds": 30
+    },
+    {
+      "name": "check_overdue",
+      "action": "check_overdue_goals",
+      "params": {},
+      "timeout_seconds": 30
+    },
+    {
+      "name": "format_review",
+      "action": "format_goal_review",
+      "params": {
+        "active": "$ctx.step_list_active_result",
+        "overdue": "$ctx.step_check_overdue_result"
+      },
+      "timeout_seconds": 30
+    },
+    {
+      "name": "notify_user",
+      "action": "notify",
+      "params": {
+        "message": "$ctx.step_format_review_result"
+      },
+      "timeout_seconds": 60
+    }
+  ]
+}

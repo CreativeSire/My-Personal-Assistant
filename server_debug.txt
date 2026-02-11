@@ -20,3 +20,22 @@
 --- SERVER STARTUP [22448] ---
 
 --- SERVER STARTUP [28132] ---
+
+--- SERVER STARTUP [22052] ---
+[27360] Singleton lock - exiting.
+
+--- SERVER STARTUP [25700] ---
+
+--- SERVER STARTUP [26844] ---
+
+--- SERVER STARTUP [27876] ---
+
+--- SERVER STARTUP [16284] ---
+
+--- SERVER STARTUP [22044] ---
+[21656] Singleton lock - exiting.
+
+--- SERVER STARTUP [28960] ---
+[29864] Singleton lock - exiting.
+[28464] Singleton lock - exiting.
+[14428] Singleton lock - exiting.

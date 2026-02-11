@@ -224,7 +224,11 @@ class TaskQueue:
         conn.close()
 
         try:
-            result = handler(task.payload)
+            handler_payload = dict(task.payload or {})
+            handler_payload.setdefault("_task_id", task.id)
+            handler_payload.setdefault("_channel", task.channel)
+            handler_payload.setdefault("_user_id", task.user_id)
+            result = handler(handler_payload)
             self._complete_task(task.id, result)
             logger.info(f"Task {task.id} completed")
             if self._notify_callback:

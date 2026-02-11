@@ -2,6 +2,7 @@ import os
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 
 from proactive_engine import ProactiveEngine
 from task_queue import TaskQueue
@@ -11,10 +12,18 @@ from workflow_engine import WorkflowEngine
 class TestIntegrationOrchestration(unittest.TestCase):
     def test_proactive_dedup_and_notify(self):
         engine = ProactiveEngine()
+        engine._cfg = SimpleNamespace(
+            proactive_severity_mode="critical_only",
+            proactive_email_enabled=True,
+            proactive_telegram_enabled=False,
+            whatsapp_enabled=False,
+            notify_fanout_mode="channel_aware_fanout",
+            critical_consecutive_failures=1,
+        )
         sent = []
         engine.set_notify_callback(lambda user_id, channel, msg: sent.append((user_id, channel, msg)))
         engine.register_checks_from_registry(
-            [{"name": "ping", "interval_seconds": 60, "callback": lambda: "hello", "user_id": "u1", "channel_hint": "telegram"}]
+            [{"name": "ping", "interval_seconds": 60, "callback": lambda: '{"alert":"ping","severity":"critical"}', "user_id": "u1", "channel_hint": "email"}]
         )
         engine._run_once()
         first_count = len(sent)

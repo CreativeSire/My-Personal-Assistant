@@ -30,6 +30,12 @@ runner = Runner(
     auto_create_session=True,
 )
 queue = TaskQueue()
+try:
+    from invoice_pipeline import run_invoice_job
+
+    queue.register_handler("invoice_job", run_invoice_job)
+except Exception:
+    pass
 
 
 def _extract_text(event) -> str:
@@ -53,7 +59,20 @@ def _run_turn(user_input: str, user_id: str, session_id: str) -> str:
         response += _extract_text(event)
     if not response.strip():
         response = "I received your input, but no textual output was returned."
-    return response.strip()
+    response = response.strip()
+
+    # --- CRITIC LAYER ---
+    if cfg.critic_enabled:
+        try:
+            from critic import get_critic
+            verdict = get_critic().evaluate(user_input, response)
+            if verdict.revised_response:
+                logger.info(f"Critic revised CLI response: score={verdict.score}")
+                response = verdict.revised_response
+        except Exception as e:
+            logger.warning(f"Critic evaluation failed (fail-open): {e}")
+
+    return response
 
 
 def run_assistant():

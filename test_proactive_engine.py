@@ -1,12 +1,24 @@
 import unittest
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 from proactive_engine import ProactiveEngine
 
 
 class TestProactiveEngine(unittest.TestCase):
+    def _cfg_stub(self):
+        return SimpleNamespace(
+            proactive_severity_mode="critical_only",
+            proactive_email_enabled=True,
+            proactive_telegram_enabled=False,
+            whatsapp_enabled=False,
+            notify_fanout_mode="channel_aware_fanout",
+            critical_consecutive_failures=1,
+        )
+
     def test_dedup_suppression(self):
         engine = ProactiveEngine()
+        engine._cfg = self._cfg_stub()
         sent = []
 
         def notifier(user_id, channel, message):
@@ -18,8 +30,8 @@ class TestProactiveEngine(unittest.TestCase):
                 {
                     "name": "dup_check",
                     "interval_seconds": 60,
-                    "callback": lambda: "same alert",
-                    "channel_hint": "telegram",
+                    "callback": lambda: '{"alert":"same","severity":"critical"}',
+                    "channel_hint": "email",
                     "user_id": "ceejay",
                 }
             ]
@@ -48,6 +60,7 @@ class TestProactiveEngine(unittest.TestCase):
 
     def test_rate_limit_behavior(self):
         engine = ProactiveEngine()
+        engine._cfg = self._cfg_stub()
         engine._max_notifications_per_hour = 2
         sent = []
 
@@ -60,17 +73,17 @@ class TestProactiveEngine(unittest.TestCase):
                 {
                     "name": "a",
                     "interval_seconds": 1,
-                    "callback": lambda: "alert_a",
+                    "callback": lambda: '{"alert":"a","severity":"critical"}',
                 },
                 {
                     "name": "b",
                     "interval_seconds": 1,
-                    "callback": lambda: "alert_b",
+                    "callback": lambda: '{"alert":"b","severity":"critical"}',
                 },
                 {
                     "name": "c",
                     "interval_seconds": 1,
-                    "callback": lambda: "alert_c",
+                    "callback": lambda: '{"alert":"c","severity":"critical"}',
                 },
             ]
         )

@@ -45,3 +45,18 @@ class SkillError(VictorError):
 class WorkflowError(VictorError):
     """Workflow definition or execution failure."""
     pass
+
+
+class PlannerError(VictorError):
+    """Plan decomposition or execution failure."""
+    pass
+
+
+class CriticError(VictorError):
+    """Response evaluation failure."""
+    pass
+
+
+class GoalError(VictorError):
+    """Goal tracking operation failure."""
+    pass

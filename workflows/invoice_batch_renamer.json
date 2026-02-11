@@ -1,0 +1,22 @@
+{
+  "name": "invoice_batch_renamer",
+  "description": "Runs the invoice renamer pipeline against an input path.",
+  "trigger": "manual",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "notify_start",
+      "action": "notify",
+      "params": {
+        "message": "Invoice renamer workflow started."
+      }
+    },
+    {
+      "name": "notify_finish",
+      "action": "notify",
+      "params": {
+        "message": "Invoice renamer workflow finished."
+      }
+    }
+  ]
+}

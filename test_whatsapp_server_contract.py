@@ -25,6 +25,7 @@ class TestWhatsAppServerContract(unittest.TestCase):
             gemini_api_key="k",
             telegram_bot_token="t",
             memory_v3_enabled=False,
+            proactive_email_enabled=False,
             whatsapp_enabled=False,
             app_env="dev",
             whatsapp_fallback_inmemory=True,
