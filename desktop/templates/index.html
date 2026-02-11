@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Victor OS v2.0 (Midnight)</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="left-rail">
+      <div class="rail-logo">V</div>
+      <button class="rail-btn active" data-tab="command" title="Command Center">
+        <span class="ico">⌘</span>
+      </button>
+      <button class="rail-btn" data-tab="foundry" title="Invoice Foundry">
+        <span class="ico">▦</span>
+      </button>
+      <button class="rail-btn" data-tab="cortex" title="Cortex">
+        <span class="ico">◉</span>
+      </button>
+      <button class="rail-btn" data-tab="systems" title="Systems">
+        <span class="ico">⚙</span>
+      </button>
+    </aside>
+
+    <section class="active-stage">
+      <header class="stage-header">
+        <div>
+          <h1 id="stageTitle">Command Center</h1>
+          <p id="stageSubtitle">Primary operations channel</p>
+        </div>
+        <div class="status-indicator-wrap">
+          <span class="pulse-dot" aria-hidden="true"></span>
+          <span class="status-text">Online</span>
+        </div>
+      </header>
+
+      <div class="stage-content">
+        <section id="tab-command" class="tab-view active">
+          <div id="chatStream" class="chat-stream"></div>
+          <form id="chatForm" class="chat-form">
+            <input id="chatInput" type="text" placeholder="Issue command..." autocomplete="off" />
+            <button type="submit">Transmit</button>
+          </form>
+        </section>
+
+        <section id="tab-foundry" class="tab-view">
+          <div class="drop-zone-wrap">
+            <label class="drop-zone" for="ingestFile">
+              <input id="ingestFile" type="file" accept=".zip,.pdf" hidden />
+              <div class="drop-title">Drop .zip or .pdf here</div>
+              <div class="drop-sub">or click to select from disk</div>
+            </label>
+            <form id="invoiceForm" class="invoice-form">
+              <input id="invoicePath" type="text" placeholder="Optional direct path: C:\path\to\Invoice.zip" />
+              <button type="submit">Queue Batch</button>
+            </form>
+            <div id="invoiceStatus" class="inline-status"></div>
+          </div>
+
+          <div class="truth-grid-wrap">
+            <table class="truth-grid">
+              <thead>
+                <tr>
+                  <th class="col-status">Status</th>
+                  <th class="col-file">File Name</th>
+                  <th class="col-receiver">Receiver</th>
+                  <th class="col-location">Location</th>
+                  <th class="col-invoice">Invoice #</th>
+                  <th class="col-date">Date</th>
+                  <th class="col-confidence">Confidence</th>
+                </tr>
+              </thead>
+              <tbody id="truthRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="tab-cortex" class="tab-view">
+          <div class="panel-card">
+            <h2>Cortex</h2>
+            <p>Memory and context visualization endpoint is reserved for this stage.</p>
+            <p class="muted">UI scaffold active. Backend APIs remain unchanged.</p>
+          </div>
+        </section>
+
+        <section id="tab-systems" class="tab-view">
+          <div class="panel-card">
+            <h2>Systems</h2>
+            <div id="metrics" class="metrics-grid"></div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <aside id="watchtower" class="watchtower">
+      <div class="watchtower-head">
+        <h2>Agent Watchtower</h2>
+        <button id="toggleWatchtower" class="toggle-btn" title="Collapse">❯</button>
+      </div>
+      <div class="watchtower-body">
+        <div class="status-card">
+          <div class="card-title">Chief of Staff</div>
+          <div class="card-value online">Online / Listening</div>
+        </div>
+        <div class="status-card">
+          <div class="card-title">Dev_Agent</div>
+          <div id="devAgentStatus" class="card-value idle">Idle</div>
+        </div>
+        <div class="status-card">
+          <div class="card-title">System Health</div>
+          <div id="healthBars" class="health-bars"></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <section id="auditorConsole" class="auditor-console">
+    <div class="auditor-head">
+      <h2>Auditor Console</h2>
+      <button id="toggleAuditor" class="toggle-btn" title="Minimize">⌄</button>
+    </div>
+    <div class="auditor-grid">
+      <div class="terminal-block">
+        <div class="term-title">Recent Tasks</div>
+        <div id="tasksList" class="terminal-list"></div>
+      </div>
+      <div class="terminal-block">
+        <div class="term-title">Activity Logs</div>
+        <div id="logsList" class="terminal-list"></div>
+      </div>
+    </div>
+  </section>
+
+  <div id="rowModal" class="modal">
+    <div class="modal-body">
+      <div class="modal-head">
+        <h3>Quick Edit (Preview)</h3>
+        <button id="closeModal" class="toggle-btn">✕</button>
+      </div>
+      <pre id="modalContent"></pre>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
