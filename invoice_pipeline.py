@@ -1,0 +1,1368 @@
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import uuid
+import zipfile
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from google.genai import Client
+from pypdf import PdfReader
+
+from config import get_config
+from logging_config import get_logger
+from task_queue import TaskQueue
+
+try:
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+except Exception:
+    Image = None
+    ImageEnhance = None
+    ImageFilter = None
+    ImageOps = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    import fitz
+except Exception:
+    fitz = None
+
+
+cfg = get_config()
+logger = get_logger("invoice_pipeline")
+
+_MAX_ZIP_BYTES = 200 * 1024 * 1024
+_MAX_FILES = 500
+_GOLDEN_EXPECTED_COUNT = 43
+
+_api_key = cfg.gemini_api_key or cfg.google_api_key
+_genai_client = Client(api_key=_api_key) if _api_key else None
+
+
+@dataclass
+class SchemaField:
+    name: str
+    type: str
+    required: bool
+
+
+@dataclass
+class ExtractedFields:
+    fields: dict[str, Any]
+    confidence_score: float
+    schema_valid: bool
+    violations: list[str]
+    _extractor_model_used: str
+    ocr_text_present: bool
+
+    @property
+    def delivery_date(self) -> str:
+        return str(self.fields.get("delivery_date", "") or "")
+
+    @property
+    def receiver_name(self) -> str:
+        return str(self.fields.get("receiver_name", "") or "")
+
+    @property
+    def receiver_location(self) -> str:
+        return str(self.fields.get("receiver_location", "") or "")
+
+    @property
+    def invoice_number(self) -> str:
+        return str(self.fields.get("invoice_number", "") or "")
+
+
+@dataclass
+class DocumentResult:
+    status: str
+    reason: str
+    output_file: str | None
+    evidence: dict[str, Any]
+
+
+@dataclass
+class JobSummary:
+    job_id: str
+    status: str
+    started_at: str
+    completed_at: str
+    counts: dict[str, int]
+    outputs: dict[str, Any]
+    errors: list[str]
+
+
+@dataclass
+class JobContext:
+    job_id: str
+    root_dir: str
+    input_dir: str
+    ok_dir: str
+    review_dir: str
+    failed_dir: str
+    evidence_dir: str
+    run_log_path: str
+    summary_path: str
+    review_items_path: str
+    golden_report_path: str
+    output_zip_path: str
+    allowed_exts: set[str]
+    seen_hashes: set[str]
+    used_filenames: set[str]
+    source_relpaths: dict[str, str]
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.UTC).isoformat()
+
+
+def _log_line(ctx: JobContext, text: str):
+    line = f"{_now_iso()} {text}\n"
+    with open(ctx.run_log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    logger.info(text)
+
+
+def _load_schema_fields() -> list[SchemaField]:
+    schema_path = cfg.invoice_schema_path
+    if not schema_path or not os.path.exists(schema_path):
+        raise FileNotFoundError(f"Invoice schema not found: {schema_path}")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    fields = raw.get("fields", []) if isinstance(raw, dict) else []
+    if not isinstance(fields, list):
+        raise ValueError("Invoice schema must contain a 'fields' list")
+
+    parsed: list[SchemaField] = []
+    for item in fields:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        ftype = str(item.get("type", "string")).strip().lower()
+        required = bool(item.get("required", False))
+        if not name:
+            continue
+        if ftype not in {"string", "number", "integer", "boolean"}:
+            raise ValueError(f"Unsupported schema field type for {name}: {ftype}")
+        parsed.append(SchemaField(name=name, type=ftype, required=required))
+
+    if len(parsed) != 43:
+        raise ValueError(f"Invoice schema must define exactly 43 fields, got {len(parsed)}")
+
+    names = [f.name for f in parsed]
+    if len(names) != len(set(names)):
+        raise ValueError("Invoice schema has duplicate field names")
+
+    required_core = {
+        "delivery_date",
+        "receiver_name",
+        "receiver_location",
+        "invoice_number",
+        "ocr_text_present",
+        "confidence_score",
+        "_extractor_model_used",
+    }
+    if not required_core.issubset(set(names)):
+        missing = sorted(required_core - set(names))
+        raise ValueError(f"Invoice schema missing required canonical fields: {missing}")
+
+    return parsed
+
+
+SCHEMA_FIELDS = _load_schema_fields()
+FIELDS_43 = [f.name for f in SCHEMA_FIELDS]
+FIELD_TYPES = {f.name: f.type for f in SCHEMA_FIELDS}
+
+
+def _blank_for_type(ftype: str) -> Any:
+    if ftype == "number":
+        return 0.0
+    if ftype == "integer":
+        return 0
+    if ftype == "boolean":
+        return False
+    return ""
+
+
+def _blank_fields() -> dict[str, Any]:
+    return {name: _blank_for_type(ftype) for name, ftype in FIELD_TYPES.items()}
+
+
+def _safe_stem(name: str) -> str:
+    value = re.sub(r"\s+", " ", str(name or "").strip())
+    value = re.sub(r'[<>:"/\\|?*]', "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value or "UNKNOWN"
+
+
+def _sanitize_filename_token(name: str, max_len: int = 32) -> str:
+    token = _safe_stem(name).replace("'", "")
+    token = re.sub(r"[\(\)\[\]]", "", token)
+    token = re.sub(r"[^A-Za-z0-9\s._-]", "", token)
+    token = re.sub(r"\s+", "_", token).strip("._-")
+    if not token:
+        token = "UNKNOWN"
+    return token[:max_len]
+
+
+def _normalize_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.datetime.strptime(text, fmt).date().isoformat()
+        except Exception:
+            continue
+
+    m = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except Exception:
+            return ""
+
+    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2})\b", text)
+    if m:
+        try:
+            return datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+        except Exception:
+            return ""
+
+    return ""
+
+
+def _normalize_invoice_number(value: Any) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits if len(digits) == 6 else ""
+
+
+def _normalize_receiver_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    text = _safe_stem(raw)
+    if text.upper() in {"UNKNOWN", "N/A", "NONE", "NULL"}:
+        return ""
+    return re.sub(r"\s+", " ", text)
+
+
+def _normalize_receiver_location(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    text = _safe_stem(raw)
+    if text.upper() in {"UNKNOWN", "N/A", "NONE", "NULL"}:
+        return ""
+    if not text:
+        return ""
+
+    bracket_tokens = re.findall(r"\(([^\)]{2,40})\)", text)
+    for token in bracket_tokens:
+        candidate = re.sub(r"\d+", "", token).strip(" ,.-")
+        if candidate:
+            return _sanitize_filename_token(candidate, max_len=24).replace("_", " ")
+
+    split_candidates = re.split(r"[,\-]", text)
+    street_words = {
+        "street",
+        "st",
+        "road",
+        "rd",
+        "avenue",
+        "ave",
+        "close",
+        "cl",
+        "junction",
+        "house",
+        "block",
+        "plot",
+        "way",
+        "expressway",
+    }
+    for token in split_candidates:
+        candidate = re.sub(r"\d+", "", token).strip(" ,.-")
+        words = [w for w in re.split(r"\s+", candidate) if w]
+        if not words:
+            continue
+        if any(w.lower() in street_words for w in words):
+            continue
+        short = " ".join(words[:3])
+        if short:
+            return _sanitize_filename_token(short, max_len=24).replace("_", " ")
+
+    words = [w for w in re.split(r"\s+", re.sub(r"\d+", "", text)) if w]
+    short = " ".join(words[:3])
+    return _sanitize_filename_token(short, max_len=24).replace("_", " ") if short else ""
+
+
+def _normalize_number(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    text = re.sub(r"[^0-9.\-]", "", text)
+    if not text:
+        return 0.0
+    try:
+        return float(Decimal(text))
+    except (InvalidOperation, ValueError):
+        return 0.0
+
+
+def _normalize_integer(value: Any) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except Exception:
+        return 0
+
+
+def _normalize_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _normalize_by_key(key: str, value: Any) -> Any:
+    if key == "delivery_date":
+        return _normalize_date(value)
+    if key == "invoice_number":
+        return _normalize_invoice_number(value)
+    if key == "receiver_name":
+        return _normalize_receiver_name(value)
+    if key == "receiver_location":
+        return _normalize_receiver_location(value)
+
+    ftype = FIELD_TYPES.get(key, "string")
+    if ftype == "number":
+        return _normalize_number(value)
+    if ftype == "integer":
+        return _normalize_integer(value)
+    if ftype == "boolean":
+        return _normalize_boolean(value)
+    text = str(value or "").strip()
+    return _safe_stem(text) if text else ""
+
+
+def _coerce_schema_fields(raw_fields: dict[str, Any], *, model_used: str, ocr_text_present: bool) -> dict[str, Any]:
+    merged = _blank_fields()
+    for key in FIELDS_43:
+        if key in raw_fields:
+            merged[key] = _normalize_by_key(key, raw_fields.get(key))
+
+    merged["ocr_text_present"] = bool(ocr_text_present)
+    merged["_extractor_model_used"] = _safe_stem(model_used or "regex_fallback")
+
+    confidence = merged.get("confidence_score", 0.0)
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = 0.0
+    merged["confidence_score"] = max(0.0, min(1.0, confidence))
+
+    if not merged.get("receiver_outlet"):
+        rn = merged.get("receiver_name", "")
+        rl = merged.get("receiver_location", "")
+        if rn and rl:
+            merged["receiver_outlet"] = f"{rn} ({rl})"
+        elif rn:
+            merged["receiver_outlet"] = rn
+        else:
+            merged["receiver_outlet"] = ""
+
+    return merged
+
+
+def _validate_fields(fields: ExtractedFields) -> ExtractedFields:
+    violations = list(fields.violations or [])
+    raw_invoice_input = str((fields.fields or {}).get("invoice_number", "") or "")
+    raw_invoice_digits = re.sub(r"\D", "", raw_invoice_input)
+    candidate = _coerce_schema_fields(
+        fields.fields,
+        model_used=fields._extractor_model_used,
+        ocr_text_present=fields.ocr_text_present,
+    )
+
+    if set(candidate.keys()) != set(FIELDS_43):
+        violations.append("schema_extraction_failed")
+
+    if not candidate.get("delivery_date"):
+        violations.append("missing_delivery_date")
+
+    if not candidate.get("receiver_name") or not candidate.get("receiver_location"):
+        violations.append("missing_receiver")
+
+    inv = candidate.get("invoice_number", "")
+    if not inv:
+        if raw_invoice_digits:
+            violations.append("invoice_number_not_6_digits")
+        else:
+            violations.append("missing_invoice_number")
+    elif not re.fullmatch(r"\d{6}", str(inv)):
+        violations.append("invoice_number_not_6_digits")
+
+    confidence = candidate.get("confidence_score", 0.0)
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = 0.0
+    candidate["confidence_score"] = max(0.0, min(1.0, confidence))
+
+    cleaned_violations = sorted(set([v for v in violations if v]))
+    return ExtractedFields(
+        fields=candidate,
+        confidence_score=float(candidate.get("confidence_score", 0.0)),
+        schema_valid=len(cleaned_violations) == 0,
+        violations=cleaned_violations,
+        _extractor_model_used=str(candidate.get("_extractor_model_used", "regex_fallback")),
+        ocr_text_present=bool(candidate.get("ocr_text_present", False)),
+    )
+
+
+def _sha256_file(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _build_job_context(job_id: str) -> JobContext:
+    root_dir = os.path.join(cfg.workspace_dir, "jobs", job_id)
+    input_dir = os.path.join(root_dir, "input")
+    ok_dir = os.path.join(root_dir, "artifacts", "OK")
+    review_dir = os.path.join(root_dir, "artifacts", "Review")
+    failed_dir = os.path.join(root_dir, "artifacts", "Failed")
+    evidence_dir = os.path.join(root_dir, "evidence")
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(ok_dir, exist_ok=True)
+    os.makedirs(review_dir, exist_ok=True)
+    os.makedirs(failed_dir, exist_ok=True)
+    os.makedirs(evidence_dir, exist_ok=True)
+    return JobContext(
+        job_id=job_id,
+        root_dir=root_dir,
+        input_dir=input_dir,
+        ok_dir=ok_dir,
+        review_dir=review_dir,
+        failed_dir=failed_dir,
+        evidence_dir=evidence_dir,
+        run_log_path=os.path.join(root_dir, "run.log"),
+        summary_path=os.path.join(root_dir, "summary.json"),
+        review_items_path=os.path.join(root_dir, "review_items.json"),
+        golden_report_path=os.path.join(root_dir, "golden_verification_report.json"),
+        output_zip_path=os.path.join(root_dir, f"job_{job_id}_output.zip"),
+        allowed_exts=set(cfg.invoice_allowed_exts),
+        seen_hashes=set(),
+        used_filenames=set(),
+        source_relpaths={},
+    )
+
+
+def _extract_zip_to_input(src_zip: str, ctx: JobContext, allowed_exts: set[str] | None = None) -> tuple[list[str], list[str]]:
+    if os.path.getsize(src_zip) > _MAX_ZIP_BYTES:
+        raise ValueError(f"Zip exceeds max size ({_MAX_ZIP_BYTES} bytes)")
+
+    ext_filter = allowed_exts or ctx.allowed_exts
+    extracted: list[str] = []
+    unsupported: list[str] = []
+
+    with zipfile.ZipFile(src_zip, "r") as zf:
+        members = [m for m in zf.namelist() if not m.endswith("/")]
+        if len(members) > _MAX_FILES:
+            raise ValueError(f"Zip contains too many files ({len(members)} > {_MAX_FILES})")
+
+        for name in members:
+            ext = os.path.splitext(name)[1].lower().lstrip(".")
+            if ext not in ext_filter:
+                unsupported.append(name)
+                continue
+
+            base = os.path.basename(name)
+            safe = _sanitize_filename_token(os.path.splitext(base)[0], max_len=64)
+            member_id = hashlib.sha256(name.encode("utf-8", errors="ignore")).hexdigest()[:12]
+            out_name = f"{safe}__{member_id}.{ext}"
+            out_path = os.path.join(ctx.input_dir, out_name)
+
+            with zf.open(name) as src, open(out_path, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+            extracted.append(out_path)
+            ctx.source_relpaths[out_path] = name
+
+    return extracted, unsupported
+
+
+def _copy_input_file(input_path: str, ctx: JobContext) -> list[str]:
+    safe_name = os.path.basename(input_path)
+    out_path = os.path.join(ctx.input_dir, safe_name)
+    shutil.copy2(input_path, out_path)
+    ctx.source_relpaths[out_path] = safe_name
+    return [out_path]
+
+
+def _extract_text_pdf(path: str) -> tuple[str, dict[str, Any]]:
+    details: dict[str, Any] = {"source": "pdf"}
+    text_chunks: list[str] = []
+    page_count = 0
+
+    try:
+        reader = PdfReader(path)
+        page_count = len(reader.pages)
+        for page in reader.pages:
+            text_chunks.append(page.extract_text() or "")
+    except Exception:
+        pass
+
+    if fitz and pytesseract and Image:
+        try:
+            doc = fitz.open(path)
+            page_count = page_count or len(doc)
+            for page_idx in range(min(3, len(doc))):
+                pix = doc[page_idx].get_pixmap(dpi=220)
+                img_path = os.path.join(os.path.dirname(path), f"_ocr_page_{page_idx}_{uuid.uuid4().hex[:8]}.png")
+                pix.save(img_path)
+                ocr_text = _ocr_image_variants(img_path)
+                if ocr_text:
+                    text_chunks.append(ocr_text)
+                try:
+                    os.remove(img_path)
+                except Exception:
+                    pass
+            doc.close()
+        except Exception:
+            pass
+
+    details["page_count"] = page_count
+    merged = "\n".join([t for t in text_chunks if t]).strip()
+    return merged, details
+
+
+def _ocr_image_variants(path: str) -> str:
+    if not (Image and pytesseract):
+        return ""
+    try:
+        img = Image.open(path)
+    except Exception:
+        return ""
+
+    variants = [img]
+    try:
+        gray = ImageOps.grayscale(img)
+        variants.append(gray)
+        if ImageEnhance:
+            variants.append(ImageEnhance.Contrast(gray).enhance(1.8))
+        if ImageFilter:
+            variants.append(gray.filter(ImageFilter.SHARPEN))
+            variants.append(gray.filter(ImageFilter.MedianFilter(size=3)))
+        variants.append(gray.rotate(1.0, expand=True))
+        variants.append(gray.rotate(-1.0, expand=True))
+    except Exception:
+        pass
+
+    best = ""
+    for var in variants:
+        try:
+            txt = pytesseract.image_to_string(var)
+        except Exception:
+            txt = ""
+        if len(txt) > len(best):
+            best = txt
+    return best.strip()
+
+
+def _extract_text_image(path: str) -> tuple[str, dict[str, Any]]:
+    details = {
+        "source": "image_ocr",
+        "ocr_engine": "pytesseract" if pytesseract else "none",
+        "page_count": 1,
+    }
+    return _ocr_image_variants(path), details
+
+
+def _extract_text(path: str) -> tuple[str, dict[str, Any]]:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return _extract_text_pdf(path)
+    return _extract_text_image(path)
+
+
+def _json_from_response_text(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except Exception:
+            return {}
+    return {}
+
+
+def _best_preprocessed_image(input_path: str, output_path: str) -> str | None:
+    if not Image:
+        return None
+    try:
+        img = Image.open(input_path)
+        gray = ImageOps.grayscale(img)
+        if ImageEnhance:
+            gray = ImageEnhance.Contrast(gray).enhance(1.7)
+        gray.save(output_path)
+        return output_path
+    except Exception:
+        return None
+
+
+def _zone_ocr_retry(image_path: str) -> str:
+    if not (Image and pytesseract) or not image_path or not os.path.exists(image_path):
+        return ""
+    try:
+        img = Image.open(image_path)
+    except Exception:
+        return ""
+
+    w, h = img.size
+    boxes = [
+        (0, 0, w, int(h * 0.38)),
+        (0, int(h * 0.25), w, int(h * 0.75)),
+        (0, int(h * 0.62), w, h),
+    ]
+    chunks: list[str] = []
+    for box in boxes:
+        try:
+            crop = img.crop(box)
+            txt = pytesseract.image_to_string(crop)
+            if txt.strip():
+                chunks.append(txt.strip())
+        except Exception:
+            continue
+    return "\n".join(chunks).strip()
+
+
+def _first_page_image_for_vision(path: str, evidence_dir: str) -> str | None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".heic"}:
+        preview_path = os.path.join(evidence_dir, "preprocessed.png")
+        created = _best_preprocessed_image(path, preview_path)
+        if created:
+            return created
+        return path
+
+    if ext == ".pdf" and fitz:
+        try:
+            doc = fitz.open(path)
+            if len(doc) == 0:
+                return None
+            pix = doc[0].get_pixmap(dpi=220)
+            out_path = os.path.join(evidence_dir, "preprocessed.png")
+            pix.save(out_path)
+            doc.close()
+            return out_path
+        except Exception:
+            return None
+    return None
+
+
+def _required_rename_issues(fields: ExtractedFields) -> list[str]:
+    issues = []
+    if not fields.delivery_date:
+        issues.append("missing_delivery_date")
+    if not fields.receiver_name or not fields.receiver_location:
+        issues.append("missing_receiver")
+    inv = fields.invoice_number
+    if not inv:
+        issues.append("missing_invoice_number")
+    elif not re.fullmatch(r"\d{6}", inv):
+        issues.append("invoice_number_not_6_digits")
+    return issues
+
+
+def _extract_with_gemini_vision(
+    image_path: str,
+    ocr_text: str,
+    hints: dict[str, Any],
+    missing_fields: list[str] | None = None,
+    model_name: str | None = None,
+) -> ExtractedFields | None:
+    if not (_genai_client and image_path and os.path.exists(image_path)):
+        return None
+
+    model = model_name or cfg.model_name
+    missing_hint = ", ".join(missing_fields or [])
+    schema_lines = []
+    for sf in SCHEMA_FIELDS:
+        req = "required" if sf.required else "optional"
+        schema_lines.append(f"- {sf.name}: {sf.type} ({req})")
+
+    prompt = (
+        "You are extracting fields from an invoice image. Return JSON object only.\n"
+        "Never omit keys. Return exactly these 43 keys:\n"
+        + "\n".join(schema_lines)
+        + "\nCritical rename fields:\n"
+        "- receiver_name\n"
+        "- receiver_location (short locality only)\n"
+        "- invoice_number (digits-only, exactly 6)\n"
+        "- delivery_date (YYYY-MM-DD)\n"
+        "If a field is unreadable, return empty string for that field.\n"
+        + (f"Focus especially on these missing fields: {missing_hint}\n" if missing_hint else "")
+        + "OCR support text:\n"
+        + (ocr_text[:8000] if ocr_text else "")
+        + "\nHints:\n"
+        + json.dumps(hints, ensure_ascii=False)
+    )
+
+    try:
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        mime = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+        contents = [
+            {"text": prompt},
+            {"inline_data": {"mime_type": mime, "data": image_bytes}},
+        ]
+        response = _genai_client.models.generate_content(model=model, contents=contents)
+        parsed = _json_from_response_text(getattr(response, "text", "") or "")
+        if not isinstance(parsed, dict) or not parsed:
+            return None
+        candidate = ExtractedFields(
+            fields=parsed,
+            confidence_score=float(parsed.get("confidence_score") or 0.0),
+            schema_valid=False,
+            violations=[],
+            _extractor_model_used=model,
+            ocr_text_present=bool((ocr_text or "").strip()),
+        )
+        return _validate_fields(candidate)
+    except Exception:
+        return None
+
+
+def _regex_extract_fields(text: str) -> dict[str, Any]:
+    output = _blank_fields()
+    output["document_type"] = "invoice"
+    output["language"] = "en"
+
+    inv_match = re.search(r"\b(\d{6})\b", text)
+    if inv_match:
+        output["invoice_number"] = inv_match.group(1)
+
+    date_patterns = [
+        r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b",
+        r"\b(\d{1,2})[-/](\d{1,2})[-/](20\d{2})\b",
+    ]
+    detected_date = ""
+    for pat in date_patterns:
+        m = re.search(pat, text)
+        if not m:
+            continue
+        if pat.startswith(r"\b(20"):
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        else:
+            d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            detected_date = datetime.date(y, mo, d).isoformat()
+            break
+        except Exception:
+            continue
+
+    output["delivery_date"] = detected_date
+
+    receiver_patterns = [
+        r"receiver(?:\s*outlet)?[:\-]\s*(.+)",
+        r"outlet[:\-]\s*(.+)",
+        r"received by[:\-]\s*(.+)",
+    ]
+    receiver_line = ""
+    for pat in receiver_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            receiver_line = m.group(1).split("\n")[0].strip()
+            break
+
+    if receiver_line:
+        parts = [p.strip() for p in re.split(r"[,\-]", receiver_line) if p.strip()]
+        output["receiver_name"] = parts[0] if parts else receiver_line
+        output["receiver_location"] = parts[1] if len(parts) > 1 else receiver_line
+        output["receiver_outlet"] = receiver_line
+
+    output["confidence_score"] = 0.45
+    output["ocr_text_present"] = bool(text.strip())
+    output["_extractor_model_used"] = "regex_fallback"
+    return output
+
+
+def _build_gemini_prompt(text: str, hints: dict[str, Any]) -> str:
+    schema_lines = []
+    for sf in SCHEMA_FIELDS:
+        req = "required" if sf.required else "optional"
+        schema_lines.append(f"- {sf.name}: {sf.type} ({req})")
+
+    return (
+        "Extract invoice fields and return STRICT JSON only.\n"
+        "Do not include explanations.\n"
+        "Return exactly these 43 keys:\n"
+        + "\n".join(schema_lines)
+        + "\nRules:\n"
+        "- delivery_date must be YYYY-MM-DD when present\n"
+        "- invoice_number digits only\n"
+        "- confidence_score between 0 and 1\n"
+        "- ocr_text_present must be boolean\n"
+        "\nHints:\n"
+        + json.dumps(hints, ensure_ascii=False)
+        + "\n\nOCR Text:\n"
+        + text[:20000]
+    )
+
+
+def extract_invoice_fields(text: str, hints: dict) -> ExtractedFields:
+    ocr_text_present = bool((text or "").strip())
+    if not ocr_text_present:
+        base = _blank_fields()
+        base["ocr_text_present"] = False
+        base["_extractor_model_used"] = "regex_fallback"
+        return _validate_fields(
+            ExtractedFields(
+                fields=base,
+                confidence_score=0.0,
+                schema_valid=False,
+                violations=["ocr_no_text"],
+                _extractor_model_used="regex_fallback",
+                ocr_text_present=False,
+            )
+        )
+
+    if _genai_client:
+        prompt = _build_gemini_prompt(text, hints)
+        for model_name in [cfg.model_name, "gemini-1.5-pro"]:
+            if not model_name:
+                continue
+            try:
+                response = _genai_client.models.generate_content(model=model_name, contents=prompt)
+                raw = (getattr(response, "text", "") or "").strip()
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Extractor output is not a JSON object")
+                candidate = ExtractedFields(
+                    fields=parsed,
+                    confidence_score=float(parsed.get("confidence_score") or 0.0),
+                    schema_valid=False,
+                    violations=[],
+                    _extractor_model_used=model_name,
+                    ocr_text_present=ocr_text_present,
+                )
+                validated = _validate_fields(candidate)
+                if validated.schema_valid:
+                    return validated
+            except Exception:
+                continue
+
+    regex_candidate = ExtractedFields(
+        fields=_regex_extract_fields(text),
+        confidence_score=0.45,
+        schema_valid=False,
+        violations=[],
+        _extractor_model_used="regex_fallback",
+        ocr_text_present=ocr_text_present,
+    )
+    return _validate_fields(regex_candidate)
+
+
+def _resolve_collision(base_name: str, ctx: JobContext) -> str:
+    candidate = base_name
+    idx = 2
+    while candidate.lower() in ctx.used_filenames:
+        stem, ext = os.path.splitext(base_name)
+        candidate = f"{stem}_DUP{idx}{ext}"
+        idx += 1
+    ctx.used_filenames.add(candidate.lower())
+    return candidate
+
+
+def _to_pdf_path(path: str, out_path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        shutil.copy2(path, out_path)
+        return out_path
+    if not Image:
+        raise RuntimeError("Pillow not available for image-to-pdf conversion")
+    img = Image.open(path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(out_path, "PDF", resolution=100.0)
+    return out_path
+
+
+def build_output_pdf(input_path: str, normalized_name: str, out_dir: str) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, normalized_name)
+    return _to_pdf_path(input_path, out_path)
+
+
+def _build_ok_filename(fields: ExtractedFields) -> str:
+    receiver_name = _sanitize_filename_token(fields.receiver_name, max_len=40)
+    receiver_location = _sanitize_filename_token(fields.receiver_location, max_len=24)
+    invoice_number = fields.invoice_number
+    delivery_date = fields.delivery_date
+    return f"{receiver_name}_{receiver_location}_{invoice_number}_{delivery_date}.pdf"
+
+
+def _build_expected_index(expected_raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if not isinstance(expected_raw, dict):
+        return {}
+
+    if isinstance(expected_raw.get("items"), list):
+        index: dict[str, dict[str, Any]] = {}
+        for item in expected_raw["items"]:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("source_id") or "").strip().lower()
+            fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
+            if key and fields:
+                index[key] = fields
+        return index
+
+    index = {}
+    for key, value in expected_raw.items():
+        if not isinstance(value, dict):
+            continue
+        fields = value.get("fields") if isinstance(value.get("fields"), dict) else value
+        if isinstance(fields, dict):
+            index[str(key).strip().lower()] = fields
+    return index
+
+
+def _load_expected_labels(path: str) -> dict[str, dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return _build_expected_index(data)
+    except Exception:
+        return {}
+
+
+def _normalize_for_compare(key: str, value: Any) -> Any:
+    if key == "delivery_date":
+        return _normalize_date(value)
+    if key == "invoice_number":
+        return _normalize_invoice_number(value)
+    if key == "receiver_name":
+        return _normalize_receiver_name(value).lower()
+    if key == "receiver_location":
+        return _normalize_receiver_location(value).lower()
+
+    ftype = FIELD_TYPES.get(key, "string")
+    if ftype == "number":
+        return round(_normalize_number(value), 4)
+    if ftype == "integer":
+        return _normalize_integer(value)
+    if ftype == "boolean":
+        return _normalize_boolean(value)
+    return _safe_stem(str(value or "")).lower()
+
+
+def _compare_fields(expected: dict[str, Any], actual: dict[str, Any]) -> list[dict[str, Any]]:
+    diffs: list[dict[str, Any]] = []
+    for key in FIELDS_43:
+        exp = _normalize_for_compare(key, expected.get(key))
+        got = _normalize_for_compare(key, actual.get(key))
+        if exp != got:
+            diffs.append({"field": key, "expected": expected.get(key), "actual": actual.get(key)})
+    return diffs
+
+
+def _build_golden_verification_report(
+    ctx: JobContext,
+    outputs: list[dict[str, Any]],
+    counts: dict[str, int],
+    errors: list[str],
+) -> dict[str, Any]:
+    rename_success_count = 0
+    samples: list[str] = []
+    for item in outputs:
+        if item.get("status") == "ok" and item.get("output_file"):
+            rename_success_count += 1
+            samples.append(str(item.get("output_file")))
+
+    pass_counts = (
+        counts.get("total", 0) == _GOLDEN_EXPECTED_COUNT
+        and counts.get("ok", 0) == _GOLDEN_EXPECTED_COUNT
+        and counts.get("review", 0) == 0
+        and counts.get("failed", 0) == 0
+    )
+    pass_rename = rename_success_count == _GOLDEN_EXPECTED_COUNT
+
+    return {
+        "mode": "golden_verify",
+        "job_id": ctx.job_id,
+        "input_path": cfg.golden_input_path,
+        "expected_count": _GOLDEN_EXPECTED_COUNT,
+        "processed_count": counts.get("total", 0),
+        "counts": counts,
+        "rename_success_count": rename_success_count,
+        "rename_samples": samples[:10],
+        "pass_counts": pass_counts,
+        "pass_rename": pass_rename,
+        "pass_all": pass_counts and pass_rename,
+        "errors": errors,
+    }
+
+
+def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
+    basename = os.path.basename(path)
+    source_key = job_ctx.source_relpaths.get(path, basename)
+    digest = _sha256_file(path)
+    if digest in job_ctx.seen_hashes:
+        return DocumentResult(
+            status="skipped_duplicate",
+            reason="hash_identical_duplicate",
+            output_file=None,
+            evidence={"input_file": basename, "source_key": source_key, "source_id": digest},
+        )
+    job_ctx.seen_hashes.add(digest)
+
+    try:
+        evidence_dir = os.path.join(job_ctx.evidence_dir, digest[:12])
+        os.makedirs(evidence_dir, exist_ok=True)
+
+        text, extraction_meta = _extract_text(path)
+        with open(os.path.join(evidence_dir, "ocr_raw.txt"), "w", encoding="utf-8") as f:
+            f.write(text or "")
+
+        preview_path = _first_page_image_for_vision(path, evidence_dir)
+        attempts: list[dict[str, Any]] = []
+        hints = {"filename": basename, "source_key": source_key}
+
+        # Pass A: OCR text + Gemini extraction.
+        fields = extract_invoice_fields(text, hints)
+        issues = _required_rename_issues(fields)
+        attempts.append(
+            {
+                "pass": "A",
+                "strategy": "ocr_plus_gemini_text",
+                "issues": issues,
+                "model": fields._extractor_model_used,
+                "schema_valid": fields.schema_valid,
+            }
+        )
+
+        # Pass B: Stronger vision extraction targeting missing rename fields.
+        if issues and preview_path:
+            b_fields = _extract_with_gemini_vision(
+                image_path=preview_path,
+                ocr_text=text,
+                hints=hints,
+                missing_fields=issues,
+                model_name="gemini-1.5-pro",
+            )
+            if b_fields:
+                b_issues = _required_rename_issues(b_fields)
+                attempts.append(
+                    {
+                        "pass": "B",
+                        "strategy": "vision_targeted",
+                        "issues": b_issues,
+                        "model": b_fields._extractor_model_used,
+                        "schema_valid": b_fields.schema_valid,
+                    }
+                )
+                if len(b_issues) < len(issues):
+                    fields = b_fields
+                    issues = b_issues
+
+        # Pass C: Zone OCR retry + targeted vision retry.
+        if issues and preview_path:
+            zone_text = _zone_ocr_retry(preview_path)
+            text_c = "\n".join([t for t in [text, zone_text] if t]).strip()
+            c_fields_text = extract_invoice_fields(text_c, hints)
+            c_issues = _required_rename_issues(c_fields_text)
+            attempts.append(
+                {
+                    "pass": "C",
+                    "strategy": "zone_ocr_plus_text_retry",
+                    "issues": c_issues,
+                    "model": c_fields_text._extractor_model_used,
+                    "schema_valid": c_fields_text.schema_valid,
+                }
+            )
+            if len(c_issues) < len(issues):
+                fields = c_fields_text
+                issues = c_issues
+
+            if issues:
+                c_fields_vision = _extract_with_gemini_vision(
+                    image_path=preview_path,
+                    ocr_text=text_c,
+                    hints=hints,
+                    missing_fields=issues,
+                    model_name=cfg.model_name,
+                )
+                if c_fields_vision:
+                    cv_issues = _required_rename_issues(c_fields_vision)
+                    attempts.append(
+                        {
+                            "pass": "C2",
+                            "strategy": "zone_ocr_plus_vision_retry",
+                            "issues": cv_issues,
+                            "model": c_fields_vision._extractor_model_used,
+                            "schema_valid": c_fields_vision.schema_valid,
+                        }
+                    )
+                    if len(cv_issues) < len(issues):
+                        fields = c_fields_vision
+                        issues = cv_issues
+
+        debug_payload = {
+            "source_file": basename,
+            "source_key": source_key,
+            "source_id": digest,
+            "attempts": attempts,
+            "final_issues": issues,
+            "final_fields": fields.fields,
+            "meta": extraction_meta,
+        }
+        with open(os.path.join(evidence_dir, "extraction_debug.json"), "w", encoding="utf-8") as f:
+            json.dump(debug_payload, f, indent=2, ensure_ascii=False)
+
+        base_evidence = {
+            "input_file": basename,
+            "source_key": source_key,
+            "source_id": digest,
+            "ocr_text_present": bool((text or "").strip()),
+            "ocr_text_excerpt": (text or "")[:1000],
+            "fields": fields.fields,
+            "meta": extraction_meta,
+            "debug_paths": {
+                "ocr_raw": os.path.relpath(os.path.join(evidence_dir, "ocr_raw.txt"), job_ctx.root_dir).replace("\\", "/"),
+                "preprocessed": (
+                    os.path.relpath(preview_path, job_ctx.root_dir).replace("\\", "/")
+                    if preview_path and os.path.exists(preview_path)
+                    else None
+                ),
+                "extraction_debug": os.path.relpath(os.path.join(evidence_dir, "extraction_debug.json"), job_ctx.root_dir).replace("\\", "/"),
+            },
+        }
+
+        if issues or not fields.schema_valid:
+            review_name = _resolve_collision(f"{_sanitize_filename_token(os.path.splitext(basename)[0], max_len=64)}.pdf", job_ctx)
+            output = build_output_pdf(path, review_name, job_ctx.review_dir)
+            reason = ";".join(sorted(set((fields.violations or []) + issues))) or "schema_extraction_failed"
+            return DocumentResult(
+                status="review",
+                reason=reason,
+                output_file=output,
+                evidence=base_evidence,
+            )
+
+        normalized_name = _resolve_collision(_build_ok_filename(fields), job_ctx)
+        output = build_output_pdf(path, normalized_name, job_ctx.ok_dir)
+        return DocumentResult(
+            status="ok",
+            reason="validated",
+            output_file=output,
+            evidence=base_evidence,
+        )
+    except Exception as e:
+        failed_name = _resolve_collision(f"{_sanitize_filename_token(os.path.splitext(basename)[0], max_len=64)}.pdf", job_ctx)
+        output_path = None
+        try:
+            output_path = build_output_pdf(path, failed_name, job_ctx.failed_dir)
+        except Exception:
+            output_path = None
+        return DocumentResult(
+            status="failed",
+            reason=f"pipeline_exception:{e}",
+            output_file=output_path,
+            evidence={
+                "input_file": basename,
+                "source_key": source_key,
+                "source_id": digest,
+                "error": str(e),
+            },
+        )
+
+
+def _zip_results(ctx: JobContext):
+    with zipfile.ZipFile(ctx.output_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(ctx.root_dir):
+            for file_name in files:
+                if file_name == os.path.basename(ctx.output_zip_path):
+                    continue
+                full = os.path.join(root, file_name)
+                arc = os.path.relpath(full, ctx.root_dir)
+                zf.write(full, arc)
+
+
+def enqueue_invoice_job(input_path: str, channel: str, user_id: str) -> str:
+    queue = TaskQueue()
+    task_id = queue.enqueue(
+        task_type="invoice_job",
+        payload={"input_path": input_path},
+        channel=channel,
+        user_id=user_id,
+        priority=2,
+    )
+    return task_id
+
+
+def run_invoice_job(payload: dict) -> str:
+    if not cfg.invoice_job_enabled:
+        return "Invoice job is disabled by configuration."
+
+    task_id = str(payload.get("_task_id") or "")
+    job_mode = str(payload.get("mode") or cfg.invoice_mode or "production").strip().lower()
+    input_path = str(payload.get("input_path") or "").strip()
+    if not input_path and job_mode == "golden_verify":
+        input_path = cfg.golden_input_path
+    if not input_path or not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+
+    queue = TaskQueue()
+    job_id = uuid.uuid4().hex[:12]
+    ctx = _build_job_context(job_id)
+    started = _now_iso()
+    counts = {"total": 0, "ok": 0, "review": 0, "skipped_duplicate": 0, "failed": 0}
+    outputs: list[dict[str, Any]] = []
+    review_items: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    _log_line(ctx, f"Invoice job started input={input_path}")
+    if task_id:
+        queue.update_progress(task_id, 5, "Invoice job started")
+
+    paths: list[str] = []
+    golden_image_exts = {"png", "jpg", "jpeg"}
+    allowed_exts = ctx.allowed_exts
+    if job_mode == "golden_verify" and cfg.golden_images_only:
+        allowed_exts = golden_image_exts
+
+    if os.path.splitext(input_path)[1].lower() == ".zip":
+        paths, unsupported = _extract_zip_to_input(input_path, ctx, allowed_exts=allowed_exts)
+        for name in unsupported:
+            counts["failed"] += 1
+            outputs.append(
+                {
+                    "input_file": os.path.basename(name),
+                    "status": "failed",
+                    "reason": "unsupported_file_type",
+                    "output_file": None,
+                    "evidence": {"source_key": name},
+                }
+            )
+    else:
+        ext = os.path.splitext(input_path)[1].lower().lstrip(".")
+        if ext not in allowed_exts:
+            raise ValueError(f"Unsupported invoice input file type: .{ext}")
+        paths = _copy_input_file(input_path, ctx)
+
+    counts["total"] = len(paths)
+    if task_id:
+        queue.update_progress(task_id, 20, f"Loaded {len(paths)} input file(s)")
+
+    for idx, path in enumerate(paths, start=1):
+        result = process_document(path, ctx)
+        counts[result.status] = counts.get(result.status, 0) + 1
+        item = {
+            "input_file": os.path.basename(path),
+            "status": result.status,
+            "reason": result.reason,
+            "output_file": os.path.relpath(result.output_file, ctx.root_dir) if result.output_file else None,
+            "evidence": result.evidence,
+        }
+        outputs.append(item)
+        if result.status in {"review", "failed"}:
+            review_items.append(item)
+
+        if task_id and counts["total"] > 0:
+            progress = 20 + int((idx / counts["total"]) * 70)
+            queue.update_progress(task_id, min(progress, 95), f"Processed {idx}/{counts['total']} file(s)")
+
+    runtime_status = "SUCCESS" if counts["failed"] == 0 else "PARTIAL_FAILURE"
+    if counts["ok"] + counts["review"] == 0 and counts["failed"] > 0:
+        runtime_status = "FAILED"
+
+    summary = JobSummary(
+        job_id=job_id,
+        status=runtime_status,
+        started_at=started,
+        completed_at=_now_iso(),
+        counts=counts,
+        outputs={
+            "output_zip": os.path.relpath(ctx.output_zip_path, cfg.base_dir),
+            "ok_dir": os.path.relpath(ctx.ok_dir, ctx.root_dir),
+            "review_dir": os.path.relpath(ctx.review_dir, ctx.root_dir),
+            "failed_dir": os.path.relpath(ctx.failed_dir, ctx.root_dir),
+            "items": outputs,
+        },
+        errors=errors,
+    )
+
+    with open(ctx.summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary.__dict__, f, indent=2, ensure_ascii=False)
+
+    if review_items:
+        with open(ctx.review_items_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "job_id": job_id,
+                    "count": len(review_items),
+                    "items": review_items,
+                    "preview_paths": [item["output_file"] for item in review_items if item.get("output_file")],
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    if job_mode == "golden_verify":
+        report = _build_golden_verification_report(
+            ctx=ctx,
+            outputs=outputs,
+            counts=counts,
+            errors=errors,
+        )
+        with open(ctx.golden_report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        if not report.get("pass_all"):
+            _log_line(
+                ctx,
+                (
+                    "Golden verification failed: "
+                    f"pass_counts={report.get('pass_counts')} "
+                    f"pass_rename={report.get('pass_rename')}"
+                ),
+            )
+        else:
+            _log_line(ctx, "Golden verification passed: operational 43/43 with rename success")
+
+    _zip_results(ctx)
+    _log_line(
+        ctx,
+        (
+            f"Invoice job complete: ok={counts['ok']} review={counts['review']} "
+            f"skipped={counts['skipped_duplicate']} failed={counts['failed']}"
+        ),
+    )
+    if task_id:
+        queue.update_progress(task_id, 100, "Invoice job completed")
+
+    rel_zip = os.path.relpath(ctx.output_zip_path, cfg.base_dir).replace("\\", "/")
+    return (
+        f"<<SEND_FILE: {rel_zip}>> "
+        f"Invoice job complete. Total={counts['total']}, OK={counts['ok']}, Review={counts['review']}, "
+        f"Skipped={counts['skipped_duplicate']}, Failed={counts['failed']}."
+    )
