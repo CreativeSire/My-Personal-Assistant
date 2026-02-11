@@ -20,3 +20,30 @@
 14:32:06 [INFO] victor_os.workflow_engine: Scheduled workflow 'ops_daily_brief' daily at 08:00
 14:32:06 [INFO] victor_os.workflow_engine: Workflow scheduler started with 2 job(s)
 14:32:09 [INFO] victor_os.proactive_engine: Proactive check 'ops_health_threshold' buffered critical streak=1
+14:37:11 [INFO] victor_os.proactive_engine: Proactive check 'ops_health_threshold' buffered critical streak=2
+14:37:46 [INFO] victor_os.telegram_server: Processing: Run the ops_daily_brief workflow 
+14:37:47 [INFO] victor_os.monitor: Input Received
+Warning: there are non-text parts in the response: ['function_call'], returning concatenated text result from text parts. Check the full candidates.content.parts accessor to get the full model response.
+14:37:53 [INFO] victor_os.workflow_engine: Loaded 5 workflow definition(s)
+14:37:53 [INFO] victor_os.workflow_engine: Starting workflow 'ops_daily_brief' run=97e794ff6313
+14:37:55 [INFO] victor_os.workflow_engine: Workflow 'ops_daily_brief' run=97e794ff6313 finished: completed
+14:38:03 [INFO] victor_os.memory_core: Memory inserted: agent_status_1770817083547
+14:38:03 [INFO] victor_os.memory_core: Memory inserted: agent_artifact_1770817083967
+14:38:04 [INFO] victor_os.monitor: Text Response Sent
+14:42:17 [INFO] victor_os.tools: Email sent: Critical Victor-OS Alert
+14:42:17 [INFO] victor_os.proactive_engine: Proactive alert sent for user=ceejay via channels=['telegram', 'email']
+14:47:27 [WARNING] victor_os.proactive_engine: Proactive check failed (market_watch_moves): The read operation timed out
+14:47:29 [ERROR] victor_os.telegram_server: Notification push failed: ('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))
+14:47:31 [INFO] victor_os.tools: Email sent: Critical Victor-OS Alert
+14:47:31 [INFO] victor_os.proactive_engine: Proactive alert sent for user=ceejay via channels=['telegram', 'email']
+14:52:38 [INFO] victor_os.tools: Email sent: Critical Victor-OS Alert
+14:52:38 [INFO] victor_os.proactive_engine: Proactive alert sent for user=ceejay via channels=['telegram', 'email']
+14:53:12 [INFO] victor_os.telegram_server: Processing: Okay stop ops_daily_brief workflow 
+14:53:13 [INFO] victor_os.monitor: Input Received
+14:53:23 [INFO] victor_os.memory_core: Memory inserted: agent_status_1770818003917
+14:53:24 [INFO] victor_os.monitor: Text Response Sent
+14:57:40 [ERROR] victor_os.telegram_server: Notification push failed: ('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))
+14:57:43 [INFO] victor_os.tools: Email sent: Critical Victor-OS Alert
+14:57:43 [INFO] victor_os.proactive_engine: Proactive alert sent for user=ceejay via channels=['telegram', 'email']
+15:02:50 [INFO] victor_os.tools: Email sent: Critical Victor-OS Alert
+15:02:50 [INFO] victor_os.proactive_engine: Proactive alert sent for user=ceejay via channels=['telegram', 'email']

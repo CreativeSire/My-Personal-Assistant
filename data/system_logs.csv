@@ -627,3 +627,6 @@ Also, how good i..."
 2026-02-11 14:57:43,proactive_engine,"Proactive alert sent for user=ceejay via channels=['telegram', 'email']",INFO,
 2026-02-11 15:02:50,tools,Email sent: Critical Victor-OS Alert,INFO,
 2026-02-11 15:02:50,proactive_engine,"Proactive alert sent for user=ceejay via channels=['telegram', 'email']",INFO,
+2026-02-11 15:07:53,telegram_server,"Notification push failed: ('Connection aborted.', ConnectionResetError(10054, 'An existing connectio",ERROR,
+2026-02-11 15:07:55,tools,Email sent: Critical Victor-OS Alert,INFO,
+2026-02-11 15:07:55,proactive_engine,"Proactive alert sent for user=ceejay via channels=['telegram', 'email']",INFO,
