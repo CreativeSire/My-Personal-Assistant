@@ -9,6 +9,7 @@ import tempfile
 import time
 from typing import Any
 from tendo import singleton
+from pathlib import Path
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -21,6 +22,19 @@ from logging_config import get_logger, setup_logging, new_correlation_id
 from session_manager import get_session_service, resolve_user_id, resolve_session_id
 from resilience import telegram_breaker, gemini_breaker
 
+ROOT_DIR = str(Path(__file__).resolve().parent.parent)
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+try:
+    from data_engine import get_data_engine
+    from victor_core import PolicyEngine, PolicyInput, Telemetry
+except Exception:
+    get_data_engine = None  # type: ignore[assignment]
+    PolicyEngine = None  # type: ignore[assignment]
+    PolicyInput = None  # type: ignore[assignment]
+    Telemetry = None  # type: ignore[assignment]
+
 cfg = validate_or_raise(get_config())
 setup_logging(cfg.log_dir)
 logger = get_logger("telegram_server")
@@ -29,6 +43,39 @@ BASE_DIR = cfg.base_dir
 MEMORY_DB_PATH = cfg.memory_db_path
 WORKSPACE_DIR = cfg.workspace_dir
 MEMORY_V3_ENABLED = cfg.memory_v3_enabled
+_data_engine = get_data_engine() if get_data_engine else None
+_telemetry = Telemetry() if Telemetry else None
+_policy_engine = PolicyEngine() if PolicyEngine else None
+_global_kill_switch = {"enabled": False}
+_TELEGRAM_MAX_DOC_MB = float(os.getenv("TELEGRAM_MAX_DOC_MB", "45"))
+_TELEGRAM_UPLOAD_TIMEOUT_SEC = int(os.getenv("TELEGRAM_UPLOAD_TIMEOUT_SEC", "180"))
+_TELEGRAM_UPLOAD_RETRIES = int(os.getenv("TELEGRAM_UPLOAD_RETRIES", "3"))
+
+
+def _emit_platform_event(
+    event_type: str,
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    actor: str = "telegram_server",
+    payload: dict[str, Any] | None = None,
+    risk_score: float = 0.0,
+) -> None:
+    if not _telemetry:
+        return
+    try:
+        _telemetry.emit(
+            event_type,
+            session_id=session_id,
+            task_id=task_id,
+            actor=actor,
+            payload=payload or {},
+            risk_score=risk_score,
+            channel="telegram",
+            source="telegram_server",
+        )
+    except Exception as exc:
+        logger.debug(f"Telemetry emit failed: {exc}")
 
 
 def _resolve_runtime_path(path_text):
@@ -147,26 +194,12 @@ def _notify_user_telegram(user_id, channel, message):
         if raw_file:
             resolved_path = _resolve_runtime_path(raw_file)
             if os.path.exists(resolved_path):
-                sent = False
-                send_error = None
-                for attempt in range(3):
-                    try:
-                        with open(resolved_path, "rb") as doc:
-                            telegram_breaker.call(bot.send_document, target, doc)
-                        sent = True
-                        break
-                    except Exception as e:
-                        send_error = e
-                        time.sleep(1.0 + attempt)
-                if not sent:
-                    size_mb = os.path.getsize(resolved_path) / (1024 * 1024)
-                    fallback = (
-                        "Output file is ready but Telegram upload failed after retries.\n"
-                        f"File: {os.path.basename(resolved_path)} ({size_mb:.2f} MB)\n"
-                        f"Local path: {resolved_path}\n"
-                        f"Error: {send_error}"
-                    )
-                    telegram_breaker.call(bot.send_message, target, fallback)
+                _send_document_with_fallback(
+                    chat_id=target,
+                    resolved_path=resolved_path,
+                    raw_path=raw_file,
+                    reply_to_message=None,
+                )
             else:
                 telegram_breaker.call(bot.send_message, target, f"Courier Error: File not found at {raw_file}")
     except Exception as e:
@@ -209,6 +242,14 @@ try:
     _task_queue.register_handler("invoice_job", run_invoice_job)
 except Exception as e:
     logger.warning(f"Invoice pipeline handler unavailable: {e}")
+
+
+def _run_generic_intent(payload: dict[str, Any]) -> str:
+    intent = str(payload.get("intent") or "task")
+    return f"Generic intent completed: {intent}"
+
+
+_task_queue.register_handler("generic_intent", _run_generic_intent)
 
 _task_queue.set_notify_callback(_notify_user_telegram)
 _task_queue.start_worker()
@@ -310,6 +351,113 @@ except Exception as e:
 def send_welcome(message):
     bot.reply_to(message, "Victor-OS is Online. I can read your texts, hear your voice, and analyze your photos!")
 
+
+@bot.message_handler(commands=["kill"])
+def handle_kill(message):
+    parts = str(message.text or "").strip().split(maxsplit=1)
+    enabled = len(parts) > 1 and parts[1].strip().lower() in {"on", "true", "1", "enable", "enabled"}
+    _global_kill_switch["enabled"] = enabled
+    _emit_platform_event(
+        "action.executed",
+        actor=str(message.chat.id),
+        payload={"kill_switch_enabled": enabled},
+        risk_score=1.0,
+    )
+    bot.reply_to(message, f"Global kill switch set to: {enabled}")
+
+
+@bot.message_handler(commands=["safe_mode"])
+def handle_safe_mode(message):
+    if _policy_engine is None:
+        bot.reply_to(message, "Policy engine unavailable.")
+        return
+    parts = str(message.text or "").strip().split(maxsplit=1)
+    enabled = len(parts) > 1 and parts[1].strip().lower() in {"on", "true", "1", "enable", "enabled"}
+    session_id = resolve_session_id("telegram", str(message.chat.id))
+    _policy_engine.set_safe_mode(session_id, enabled)
+    _emit_platform_event(
+        "action.executed",
+        session_id=session_id,
+        actor=str(message.chat.id),
+        payload={"safe_mode": enabled},
+        risk_score=0.8,
+    )
+    bot.reply_to(message, f"Session safe mode set to: {enabled}")
+
+
+@bot.message_handler(commands=["feedback"])
+def handle_feedback(message):
+    if _data_engine is None:
+        bot.reply_to(message, "Data engine unavailable.")
+        return
+    text = str(message.text or "")
+    # format: /feedback reason|rejected|preferred
+    body = text[len("/feedback"):].strip()
+    try:
+        reason, rejected, preferred = [x.strip() for x in body.split("|", 2)]
+    except Exception:
+        bot.reply_to(
+            message,
+            "Feedback format: /feedback reason_code|rejected_output|preferred_output",
+        )
+        return
+    session_id = resolve_session_id("telegram", str(message.chat.id))
+    correction_id = _data_engine.record_correction(
+        session_id=session_id,
+        task_id="",
+        channel="telegram",
+        actor=str(message.chat.id),
+        reason_code=reason,
+        rejected_output=rejected,
+        preferred_output=preferred,
+        metadata={"source": "telegram_command"},
+    )
+    _data_engine.recalc_core_features()
+    bot.reply_to(message, f"Feedback recorded: {correction_id[:10]}")
+
+
+@bot.message_handler(commands=["policy"])
+def handle_policy(message):
+    if _policy_engine is None or PolicyInput is None:
+        bot.reply_to(message, "Policy engine unavailable.")
+        return
+    # format: /policy action target
+    parts = str(message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /policy <action> [target]")
+        return
+    action = parts[1].strip().lower()
+    target = parts[2].strip() if len(parts) > 2 else ""
+    session_id = resolve_session_id("telegram", str(message.chat.id))
+    verdict = _policy_engine.evaluate(
+        PolicyInput(
+            action=action,
+            target=target,
+            channel="telegram",
+            actor=str(message.chat.id),
+        ),
+        session_id=session_id,
+    )
+    if _data_engine:
+        _data_engine.record_policy_decision(
+            action=action,
+            policy_tier=verdict.tier.value,
+            allowed=verdict.allowed,
+            reason=verdict.reason,
+            session_id=session_id,
+            actor=str(message.chat.id),
+            metadata={"target": target, "channel": "telegram"},
+        )
+    bot.reply_to(
+        message,
+        (
+            f"Policy verdict: {verdict.tier.value}\n"
+            f"Allowed: {verdict.allowed}\n"
+            f"Requires approval: {verdict.requires_approval}\n"
+            f"Reason: {verdict.reason}"
+        ),
+    )
+
 # --- SAFETY VALVE (Auto-Splitter) ---
 def send_smart_message(chat_id, text, reply_to_id=None):
     """Splits messages longer than 4000 chars and sends them in parts."""
@@ -330,6 +478,107 @@ def send_smart_message(chat_id, text, reply_to_id=None):
         else:
             telegram_breaker.call(bot.send_message, chat_id, formatted_chunk)
     return True
+
+
+def _query_recent_tasks(limit: int = 5) -> list[dict[str, Any]]:
+    db_path = os.path.join(BASE_DIR, "memory_store", "victor_tasks.db")
+    if not os.path.exists(db_path):
+        return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, task_type, status, channel, user_id, progress, retries, created_at, updated_at
+            FROM tasks
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _render_live_system_status(task_limit: int = 5) -> str:
+    tasks = _query_recent_tasks(limit=task_limit)
+    if not tasks:
+        return (
+            "System Status: queue database reachable, but no task records found yet.\n\n"
+            "Latest Tasks: none."
+        )
+    status_counts: dict[str, int] = {}
+    for t in tasks:
+        st = str(t.get("status") or "unknown")
+        status_counts[st] = status_counts.get(st, 0) + 1
+    counts_text = ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+    lines = ["System Status: LIVE (source: victor_tasks.db)", f"Recent status mix: {counts_text}", "", f"Latest {len(tasks)} Tasks:"]
+    for idx, t in enumerate(tasks, start=1):
+        lines.append(
+            f"{idx}. {t.get('id')} | {t.get('task_type')} | {t.get('status')} | "
+            f"progress={t.get('progress')} | retries={t.get('retries')}"
+        )
+    return "\n".join(lines)
+
+
+def _is_live_status_request(text: str) -> bool:
+    lower = (text or "").strip().lower()
+    has_tasks_request = bool(re.search(r"\blatest\s+\d+\s+tasks?\b", lower) or "latest tasks" in lower)
+    has_status_request = "system status" in lower or "status summary" in lower
+    return has_tasks_request or has_status_request
+
+
+def _send_document_with_fallback(chat_id: int | str, resolved_path: str, raw_path: str, reply_to_message=None) -> bool:
+    if not os.path.exists(resolved_path):
+        send_smart_message(chat_id, f"Courier Error: File not found at {raw_path}", reply_to_id=reply_to_message)
+        return False
+    file_size_mb = os.path.getsize(resolved_path) / (1024 * 1024)
+    if file_size_mb > _TELEGRAM_MAX_DOC_MB:
+        send_smart_message(
+            chat_id,
+            (
+                "Courier fallback: output generated successfully, but Telegram cannot upload this file size.\n"
+                f"File: {os.path.basename(resolved_path)} ({file_size_mb:.2f} MB)\n"
+                f"Local path: {resolved_path}\n"
+                "Action: download locally from this path or rerun with a smaller batch."
+            ),
+            reply_to_id=reply_to_message,
+        )
+        return False
+    try:
+        last_error = None
+        attempts = max(1, _TELEGRAM_UPLOAD_RETRIES)
+        for attempt in range(1, attempts + 1):
+            try:
+                with open(resolved_path, 'rb') as doc:
+                    telegram_breaker.call(
+                        bot.send_document,
+                        chat_id,
+                        doc,
+                        timeout=_TELEGRAM_UPLOAD_TIMEOUT_SEC,
+                    )
+                return True
+            except Exception as e:
+                last_error = e
+                if attempt < attempts:
+                    time.sleep(min(2 * attempt, 5))
+                    continue
+                break
+        raise last_error if last_error else RuntimeError("unknown upload failure")
+    except Exception as e:
+        send_smart_message(
+            chat_id,
+            (
+                "Courier fallback: output generated but upload failed.\n"
+                f"File: {os.path.basename(resolved_path)} ({file_size_mb:.2f} MB)\n"
+                f"Local path: {resolved_path}\n"
+                f"Error: {e}\n"
+                f"Attempts: {max(1, _TELEGRAM_UPLOAD_RETRIES)} | Timeout per attempt: {_TELEGRAM_UPLOAD_TIMEOUT_SEC}s"
+            ),
+            reply_to_id=reply_to_message,
+        )
+        return False
 
 
 def _extract_text_from_node(node, seen=None, from_text_field=False):
@@ -792,6 +1041,23 @@ def handle_document(message):
         if invoice_mode:
             from invoice_pipeline import enqueue_invoice_job
             task_id = enqueue_invoice_job(file_path, channel="telegram", user_id=user_id)
+            if _data_engine:
+                _data_engine.upsert_task_run(
+                    task_id=task_id,
+                    state="pending",
+                    channel="telegram",
+                    user_id=user_id,
+                    payload={"input_path": file_path, "task_type": "invoice_job"},
+                    metadata={"origin": "telegram_document"},
+                )
+            _emit_platform_event(
+                "plan.generated",
+                task_id=task_id,
+                session_id=resolve_session_id("telegram", user_id),
+                actor=user_id,
+                payload={"task_type": "invoice_job", "input_path": file_name},
+                risk_score=0.5,
+            )
             bot.reply_to(
                 message,
                 (
@@ -819,6 +1085,9 @@ def handle_text(message):
 def process_message(message, user_text, image_data=None):
     cid = new_correlation_id()
     user_id = str(message.chat.id)
+    if _global_kill_switch["enabled"]:
+        bot.reply_to(message, "Global kill switch is enabled. Actions are paused.")
+        return
     logger.info(f"Processing: {user_text[:80]}{'...' if len(user_text) > 80 else ''} {'(with image)' if image_data else ''}", extra={"channel": "telegram", "user_id": user_id})
     try:
         telegram_breaker.call(bot.send_chat_action, message.chat.id, 'typing')
@@ -827,7 +1096,27 @@ def process_message(message, user_text, image_data=None):
     log_activity("Telegram User", "Input Received", "Info", f"Text: {user_text[:50]}...")
 
     try:
+        session_id = resolve_session_id("telegram", user_id)
+        _emit_platform_event(
+            "intent.received",
+            session_id=session_id,
+            actor=user_id,
+            payload={"intent": user_text[:500], "has_image": bool(image_data)},
+            risk_score=0.2 if not image_data else 0.3,
+        )
         lower_text = (user_text or "").strip().lower()
+        if _is_live_status_request(lower_text):
+            live_status = _render_live_system_status(task_limit=5)
+            send_smart_message(message.chat.id, live_status, reply_to_id=message)
+            _emit_platform_event(
+                "action.executed",
+                session_id=session_id,
+                actor=user_id,
+                payload={"action": "live_status_summary", "source": "victor_tasks.db"},
+                risk_score=0.1,
+            )
+            return
+
         folder_intent = (
             ("folder" in lower_text or "folders" in lower_text)
             and any(k in lower_text for k in ["can you", "do you", "take", "accept", "support", "process"])
@@ -838,6 +1127,13 @@ def process_message(message, user_text, image_data=None):
                 "Send one .zip file containing your documents and I will process it as a background invoice job.\n"
                 "You will receive an output zip with `artifacts/OK`, `artifacts/Review`, `summary.json`, "
                 "`review_items.json`, and `run.log`."
+            )
+            _emit_platform_event(
+                "plan.generated",
+                session_id=session_id,
+                actor=user_id,
+                payload={"task_type": "invoice_job", "source": "folder_intent"},
+                risk_score=0.4,
             )
             send_smart_message(message.chat.id, quick_reply, reply_to_id=message)
             return
@@ -997,9 +1293,16 @@ def process_message(message, user_text, image_data=None):
 
                 logger.info(f"COURIER: Shipping {resolved_path}", extra={"channel": "telegram"})
                 if os.path.exists(resolved_path):
-                    with open(resolved_path, 'rb') as doc:
-                        telegram_breaker.call(bot.send_document, message.chat.id, doc)
-                    log_activity("Chief_of_Staff", "Courier Successful", "Success", f"File: {resolved_path}")
+                    uploaded = _send_document_with_fallback(
+                        chat_id=message.chat.id,
+                        resolved_path=resolved_path,
+                        raw_path=raw_path,
+                        reply_to_message=message,
+                    )
+                    if uploaded:
+                        log_activity("Chief_of_Staff", "Courier Successful", "Success", f"File: {resolved_path}")
+                    else:
+                        log_activity("Chief_of_Staff", "Courier Fallback", "Info", f"File: {resolved_path}")
                 else:
                     send_smart_message(message.chat.id, f"Courier Error: File not found at {raw_path}", reply_to_id=message)
                     log_activity("Chief_of_Staff", "Courier Failed", "Error", f"Missing: {resolved_path}")
