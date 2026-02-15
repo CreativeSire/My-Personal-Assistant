@@ -7,6 +7,7 @@ import os
 import json
 import time
 import uuid
+import hashlib
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -46,6 +47,8 @@ class Task:
     progress: int = 0
     priority: int = 3
     metadata: dict[str, Any] = field(default_factory=dict)
+    idempotency_key: str | None = None
+    lease_expires_at: float | None = None
 
 
 class TaskQueue:
@@ -88,13 +91,42 @@ class TaskQueue:
                 max_retries INTEGER DEFAULT 3,
                 progress INTEGER DEFAULT 0,
                 priority INTEGER DEFAULT 3,
-                metadata TEXT DEFAULT '{}'
+                metadata TEXT DEFAULT '{}',
+                idempotency_key TEXT,
+                lease_expires_at REAL
             )
         """)
+        self._migrate_schema(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status, priority)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_type ON tasks(task_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_idempotency ON tasks(idempotency_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_lease ON tasks(status, lease_expires_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS delivery_ledger (
+                id TEXT PRIMARY KEY,
+                destination TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dedupe
+            ON delivery_ledger(destination, dedupe_key, payload_hash)
+            """
+        )
         conn.commit()
         conn.close()
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "idempotency_key" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT")
+        if "lease_expires_at" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN lease_expires_at REAL")
 
     def register_handler(self, task_type: str, handler: Callable[[dict[str, Any]], str]) -> None:
         """Register a handler function for a task type."""
@@ -113,22 +145,53 @@ class TaskQueue:
         user_id: str = "ceejay",
         priority: int = 3,
         max_retries: int = 3,
+        idempotency_key: str | None = None,
     ) -> str:
         """Add a task to the queue. Returns task ID."""
+        if idempotency_key:
+            existing = self._find_active_by_idempotency(idempotency_key)
+            if existing:
+                logger.info(
+                    f"Reusing task {existing} for idempotency_key={idempotency_key}"
+                )
+                return existing
+
         task_id = uuid.uuid4().hex[:16]
         now = time.time()
         conn = self._connect()
         conn.execute(
             """INSERT INTO tasks (id, task_type, payload, status, channel, user_id,
-               created_at, updated_at, priority, max_retries)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               created_at, updated_at, priority, max_retries, idempotency_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, task_type, json.dumps(payload), TaskStatus.PENDING,
-             channel, user_id, now, now, priority, max_retries),
+             channel, user_id, now, now, priority, max_retries, idempotency_key),
         )
         conn.commit()
         conn.close()
         logger.info(f"Enqueued task {task_id} type={task_type}")
         return task_id
+
+    def _find_active_by_idempotency(self, idempotency_key: str) -> str | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT id FROM tasks
+                WHERE idempotency_key=?
+                  AND status IN (?, ?, ?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (
+                    idempotency_key,
+                    TaskStatus.PENDING,
+                    TaskStatus.RUNNING,
+                    TaskStatus.COMPLETED,
+                ),
+            ).fetchone()
+            return row["id"] if row else None
+        finally:
+            conn.close()
 
     def get_task(self, task_id: str) -> Task | None:
         conn = self._connect()
@@ -164,7 +227,7 @@ class TaskQueue:
         now = time.time()
         conn = self._connect()
         conn.execute(
-            "UPDATE tasks SET status=?, result=?, completed_at=?, updated_at=?, progress=100 WHERE id=?",
+            "UPDATE tasks SET status=?, result=?, completed_at=?, updated_at=?, progress=100, lease_expires_at=NULL WHERE id=?",
             (TaskStatus.COMPLETED, result, now, now, task_id),
         )
         conn.commit()
@@ -174,7 +237,7 @@ class TaskQueue:
         now = time.time()
         conn = self._connect()
         conn.execute(
-            "UPDATE tasks SET status=?, error=?, retries=?, updated_at=? WHERE id=?",
+            "UPDATE tasks SET status=?, error=?, retries=?, updated_at=?, lease_expires_at=NULL WHERE id=?",
             (TaskStatus.FAILED, error, retries, now, task_id),
         )
         conn.commit()
@@ -199,6 +262,8 @@ class TaskQueue:
             progress=row["progress"],
             priority=row["priority"],
             metadata=json.loads(row["metadata"] or "{}"),
+            idempotency_key=row["idempotency_key"],
+            lease_expires_at=row["lease_expires_at"],
         )
 
     def _process_one(self) -> bool:
@@ -217,8 +282,8 @@ class TaskQueue:
         # Mark as running
         conn = self._connect()
         conn.execute(
-            "UPDATE tasks SET status=?, started_at=?, updated_at=? WHERE id=?",
-            (TaskStatus.RUNNING, time.time(), time.time(), task.id),
+            "UPDATE tasks SET status=?, started_at=?, updated_at=?, lease_expires_at=? WHERE id=?",
+            (TaskStatus.RUNNING, time.time(), time.time(), time.time() + 600, task.id),
         )
         conn.commit()
         conn.close()
@@ -232,14 +297,19 @@ class TaskQueue:
             self._complete_task(task.id, result)
             logger.info(f"Task {task.id} completed")
             if self._notify_callback:
-                self._notify_callback(task.user_id, task.channel, f"Task completed: {result[:200]}")
+                self._notify_deduped(
+                    user_id=task.user_id,
+                    channel=task.channel,
+                    dedupe_key=f"{task.id}:completed",
+                    message=f"Task completed: {result[:200]}",
+                )
             return True
         except Exception as e:
             retries = task.retries + 1
             if retries < task.max_retries:
                 conn = self._connect()
                 conn.execute(
-                    "UPDATE tasks SET status=?, retries=?, updated_at=? WHERE id=?",
+                    "UPDATE tasks SET status=?, retries=?, updated_at=?, lease_expires_at=NULL WHERE id=?",
                     (TaskStatus.PENDING, retries, time.time(), task.id),
                 )
                 conn.commit()
@@ -249,13 +319,44 @@ class TaskQueue:
                 self._fail_task(task.id, str(e), retries)
                 logger.error(f"Task {task.id} permanently failed after {retries} attempts: {e}")
                 if self._notify_callback:
-                    self._notify_callback(task.user_id, task.channel, f"Task failed: {str(e)[:200]}")
+                    self._notify_deduped(
+                        user_id=task.user_id,
+                        channel=task.channel,
+                        dedupe_key=f"{task.id}:failed",
+                        message=f"Task failed: {str(e)[:200]}",
+                    )
             return True
+
+    def _notify_deduped(self, user_id: str, channel: str, dedupe_key: str, message: str) -> None:
+        if not self._notify_callback:
+            return
+        destination = f"{channel}:{user_id}"
+        payload_hash = hashlib.sha256(str(message).encode("utf-8")).hexdigest()
+        conn = self._connect()
+        try:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO delivery_ledger(id, destination, dedupe_key, payload_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (uuid.uuid4().hex, destination, dedupe_key, payload_hash, time.time()),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                logger.info(
+                    f"Suppressed duplicate notification destination={destination} dedupe_key={dedupe_key}"
+                )
+                return
+        finally:
+            conn.close()
+        self._notify_callback(user_id, channel, message)
 
     def start_worker(self, poll_interval: float = 5.0) -> None:
         """Start background worker thread."""
         if self._running:
             return
+        self.recover_stale_tasks()
         self._running = True
         self._worker_thread = threading.Thread(
             target=self._worker_loop, args=(poll_interval,), daemon=True
@@ -278,3 +379,47 @@ class TaskQueue:
         if self._worker_thread:
             self._worker_thread.join(timeout=10)
         logger.info("Task queue worker stopped")
+
+    def recover_stale_tasks(self, stale_seconds: float = 900.0) -> int:
+        """Requeue stale running tasks to pending."""
+        cutoff = time.time() - stale_seconds
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET status=?, updated_at=?, lease_expires_at=NULL
+                WHERE status=? AND (
+                    started_at <= ? OR
+                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+                )
+                """,
+                (TaskStatus.PENDING, time.time(), TaskStatus.RUNNING, cutoff, time.time()),
+            )
+            conn.commit()
+            recovered = cur.rowcount or 0
+            if recovered:
+                logger.warning(f"Recovered {recovered} stale running task(s)")
+            return recovered
+        finally:
+            conn.close()
+
+    def cancel_task(self, task_id: str) -> bool:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return False
+            if row["status"] in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                return False
+            conn.execute(
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                (TaskStatus.CANCELLED, time.time(), task_id),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()

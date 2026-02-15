@@ -7,6 +7,8 @@ import re
 import shutil
 import uuid
 import zipfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -711,6 +713,95 @@ def _required_rename_issues(fields: ExtractedFields) -> list[str]:
     return issues
 
 
+def _infer_receiver_from_source_key(source_key: str) -> tuple[str, str]:
+    raw = str(source_key or "").strip()
+    if not raw:
+        return "", ""
+    stem = os.path.splitext(os.path.basename(raw))[0]
+    tokens = [t for t in re.split(r"[_\-\s]+", stem) if t]
+    filtered: list[str] = []
+    for t in tokens:
+        if re.fullmatch(r"\d{6,}", t):
+            continue
+        if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", t):
+            continue
+        if t.lower() in {"invoice", "scan", "img", "image", "copy", "duplicate"}:
+            continue
+        filtered.append(t)
+    if len(filtered) >= 3:
+        name = " ".join(filtered[:2])
+        loc = filtered[2]
+    elif len(filtered) == 2:
+        name, loc = filtered[0], filtered[1]
+    elif len(filtered) == 1:
+        name, loc = filtered[0], ""
+    else:
+        return "", ""
+    return _normalize_receiver_name(name), _normalize_receiver_location(loc)
+
+
+def _infer_receiver_from_text(text: str) -> tuple[str, str]:
+    lines = [re.sub(r"\s+", " ", x).strip() for x in (text or "").splitlines()]
+    lines = [x for x in lines if x]
+    if not lines:
+        return "", ""
+
+    name = ""
+    location = ""
+    for idx, line in enumerate(lines):
+        m = re.search(r"\bParty\b[:\-]?\s*(.+)?$", line, flags=re.IGNORECASE)
+        if not m:
+            continue
+        same_line = str(m.group(1) or "").strip()
+        if same_line and same_line.lower() not in {"-", ":", "party"}:
+            name = same_line
+        for j in range(idx + 1, min(idx + 5, len(lines))):
+            nxt = lines[j]
+            if re.search(r"\b(order no|dispatch|description|quantity|amount|authori[sz]ed)\b", nxt, flags=re.IGNORECASE):
+                break
+            if not name:
+                name = nxt
+                continue
+            if not location:
+                location = nxt
+                break
+        break
+
+    if not location:
+        m_to = re.search(r"\bTo\b\s*[:\-]?\s*([A-Za-z][A-Za-z\s]{1,40})", text or "", flags=re.IGNORECASE)
+        if m_to:
+            location = m_to.group(1).strip()
+
+    return _normalize_receiver_name(name), _normalize_receiver_location(location)
+
+
+_STORE_KEYWORDS = {
+    "supermarket",
+    "hypermart",
+    "mart",
+    "market",
+    "stores",
+    "store",
+    "shop",
+}
+
+
+def _has_store_keyword(text: str) -> bool:
+    t = str(text or "").lower()
+    return any(k in t for k in _STORE_KEYWORDS)
+
+
+def _looks_person_like(text: str) -> bool:
+    tokens = [x for x in re.split(r"\s+", str(text or "").strip()) if x]
+    if not tokens:
+        return False
+    if _has_store_keyword(text):
+        return False
+    if len(tokens) <= 3 and all(re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", t) for t in tokens):
+        return True
+    return False
+
+
 def _standardize_pdf_for_evidence(path: str, evidence_dir: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     out_name = "standardized.pdf"
@@ -1278,7 +1369,10 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
 
         # Aggressive delivery-date resolution policy.
         chosen_date, date_warnings, date_candidates = _choose_best_delivery_date(fields, text, zone_texts)
-        if chosen_date and not fields.fields.get("delivery_date"):
+        current_date = _normalize_date(fields.fields.get("delivery_date", ""))
+        if chosen_date and (not current_date or current_date != chosen_date):
+            if current_date and current_date != chosen_date:
+                warning_codes.append("date_best_score_override")
             fields.fields["delivery_date"] = chosen_date
             warning_codes.extend(date_warnings or ["date_best_score_inferred"])
             if date_warnings:
@@ -1287,6 +1381,47 @@ def process_document(path: str, job_ctx: JobContext) -> DocumentResult:
         fields.warning_codes = sorted(set((fields.warning_codes or []) + warning_codes))
         fields = _validate_fields(fields)
         issues = _required_rename_issues(fields)
+        source_name, source_loc = _infer_receiver_from_source_key(source_key)
+        text_name, text_loc = _infer_receiver_from_text(text)
+        patched = False
+        receiver_warnings: list[str] = []
+        current_name = _normalize_receiver_name(fields.fields.get("receiver_name", ""))
+        current_loc = _normalize_receiver_location(fields.fields.get("receiver_location", ""))
+
+        if not current_name:
+            fallback_name = text_name or source_name
+            if fallback_name:
+                fields.fields["receiver_name"] = fallback_name
+                patched = True
+                receiver_warnings.append("receiver_inferred")
+
+        if not current_loc:
+            fallback_loc = text_loc or source_loc
+            if fallback_loc:
+                fields.fields["receiver_location"] = fallback_loc
+                patched = True
+                receiver_warnings.append("receiver_location_inferred")
+
+        current_name = _normalize_receiver_name(fields.fields.get("receiver_name", ""))
+        current_loc = _normalize_receiver_location(fields.fields.get("receiver_location", ""))
+
+        if text_name and _has_store_keyword(text_name):
+            if (not _has_store_keyword(current_name)) or _looks_person_like(current_name):
+                fields.fields["receiver_name"] = text_name
+                patched = True
+                receiver_warnings.append("receiver_party_override")
+
+        if text_loc:
+            if _looks_person_like(current_loc) or len(str(current_loc or "").split()) > 3:
+                fields.fields["receiver_location"] = text_loc
+                patched = True
+                receiver_warnings.append("receiver_location_override")
+
+        if patched:
+            fields.warning_codes = sorted(set((fields.warning_codes or []) + receiver_warnings))
+            fields = _validate_fields(fields)
+            issues = _required_rename_issues(fields)
+
         if float(fields.confidence_score or 0.0) < 0.8:
             fields.warning_codes = sorted(set((fields.warning_codes or []) + ["low_confidence_extraction"]))
 
@@ -1395,15 +1530,85 @@ def _zip_results(ctx: JobContext):
 
 
 def enqueue_invoice_job(input_path: str, channel: str, user_id: str) -> str:
+    normalized_input = os.path.abspath(str(input_path or "").strip())
+    if not normalized_input:
+        raise ValueError("input_path is required")
+
+    # Deterministic idempotency key per user/channel/path+mtime for stable retries.
+    stat = os.stat(normalized_input)
+    idem_seed = f"{user_id}|{channel}|{normalized_input}|{int(stat.st_mtime)}|{stat.st_size}"
+    idempotency_key = hashlib.sha256(idem_seed.encode("utf-8")).hexdigest()[:32]
+
+    task_id = _enqueue_via_control_api(
+        input_path=normalized_input,
+        channel=channel,
+        user_id=user_id,
+        idempotency_key=idempotency_key,
+    )
+    if task_id:
+        return task_id
+
+    # Fallback if control API process is unavailable.
     queue = TaskQueue()
-    task_id = queue.enqueue(
+    return queue.enqueue(
         task_type="invoice_job",
-        payload={"input_path": input_path},
+        payload={"input_path": normalized_input, "task_type": "invoice_job"},
         channel=channel,
         user_id=user_id,
         priority=2,
+        idempotency_key=idempotency_key,
     )
-    return task_id
+
+
+def _enqueue_via_control_api(
+    *,
+    input_path: str,
+    channel: str,
+    user_id: str,
+    idempotency_key: str,
+) -> str | None:
+    base_url = os.getenv("VICTOR_TASK_API_URL", "http://127.0.0.1:8787").rstrip("/")
+    url = f"{base_url}/v1/tasks"
+    payload = {
+        "intent": f"enqueue invoice job for {os.path.basename(input_path)}",
+        "channel": channel,
+        "user_id": user_id,
+        "idempotency_key": idempotency_key,
+        "risk_level_hint": "medium",
+        "context_refs": [input_path],
+        "payload": {
+            "task_type": "invoice_job",
+            "input_path": input_path,
+        },
+    }
+    request_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=request_data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning(f"Control API unavailable, fallback to local enqueue: {exc}")
+        return None
+    except Exception as exc:
+        logger.warning(f"Control API enqueue failed unexpectedly, fallback to local queue: {exc}")
+        return None
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        logger.warning("Control API returned non-JSON response, fallback to local queue")
+        return None
+
+    if not data.get("ok"):
+        logger.warning(f"Control API rejected enqueue: {data}")
+        return None
+    task_id = str(data.get("task_id") or "").strip()
+    return task_id or None
 
 
 def run_invoice_job(payload: dict) -> str:

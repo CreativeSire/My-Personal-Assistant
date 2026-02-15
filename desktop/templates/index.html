@@ -4,24 +4,53 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Victor OS v2.0 (Midnight)</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20260212f">
 </head>
 <body>
   <div class="app-shell">
     <aside class="left-rail">
-      <div class="rail-logo">V</div>
-      <button class="rail-btn active" data-tab="command" title="Command Center">
-        <span class="ico">⌘</span>
-      </button>
-      <button class="rail-btn" data-tab="foundry" title="Invoice Foundry">
-        <span class="ico">▦</span>
-      </button>
-      <button class="rail-btn" data-tab="cortex" title="Cortex">
-        <span class="ico">◉</span>
-      </button>
-      <button class="rail-btn" data-tab="systems" title="Systems">
-        <span class="ico">⚙</span>
-      </button>
+      <div class="rail-nav">
+        <div class="rail-logo">V</div>
+        <button class="rail-btn active" data-tab="command" title="Command Center">
+          <span class="ico">⌘</span>
+          <span class="rail-label">Command Center</span>
+        </button>
+        <button class="rail-btn" data-tab="foundry" title="Invoice Foundry">
+          <span class="ico">▦</span>
+          <span class="rail-label">Invoice Foundry</span>
+        </button>
+        <button class="rail-btn" data-tab="cortex" title="Cortex">
+          <span class="ico">◉</span>
+          <span class="rail-label">Cortex</span>
+        </button>
+        <button class="rail-btn" data-tab="strategy" title="Strategy">
+          <span class="ico">◈</span>
+          <span class="rail-label">Strategy</span>
+        </button>
+        <button class="rail-btn" data-tab="systems" title="Systems">
+          <span class="ico">⚙</span>
+          <span class="rail-label">Systems</span>
+        </button>
+      </div>
+      <div class="history-panel">
+        <div class="history-head">
+          <h3>Context Rail</h3>
+          <div class="history-actions">
+            <button id="newChat" class="toggle-btn mini-btn" title="New Chat">＋</button>
+            <button id="refreshSessions" class="toggle-btn mini-btn" title="Refresh">⟳</button>
+            <button class="toggle-btn mini-btn" title="More">⋮</button>
+          </div>
+        </div>
+        <div id="historyGroups" class="history-groups"></div>
+        <details class="left-accordion" open>
+          <summary>Artifact Gallery</summary>
+          <div id="leftArtifactRail" class="left-artifact-rail"></div>
+        </details>
+        <details class="left-accordion" open>
+          <summary>Resource Governor</summary>
+          <div id="leftResourceRows" class="left-resource-rows"></div>
+        </details>
+      </div>
     </aside>
 
     <section class="active-stage">
@@ -31,6 +60,7 @@
           <p id="stageSubtitle">Primary operations channel</p>
         </div>
         <div class="status-indicator-wrap">
+          <span id="visionRec" class="rec-indicator hidden">● REC</span>
           <span class="pulse-dot" aria-hidden="true"></span>
           <span class="status-text">Online</span>
         </div>
@@ -38,11 +68,30 @@
 
       <div class="stage-content">
         <section id="tab-command" class="tab-view active">
+          <div class="sensory-feed">
+            <div class="feed-left">
+              <span class="speaker-icon">🔊</span>
+              <span class="feed-label">Sensory Feed</span>
+            </div>
+            <span class="feed-bars"><i></i><i></i><i></i><i></i><i></i></span>
+          </div>
+          <div class="agent-activity-bar">
+            <span class="agent-chip-label">Agent Active</span>
+            <span id="agentActivityText" class="agent-chip-value">Chief_of_Staff standing by...</span>
+          </div>
           <div id="chatStream" class="chat-stream"></div>
-          <form id="chatForm" class="chat-form">
-            <input id="chatInput" type="text" placeholder="Issue command..." autocomplete="off" />
-            <button type="submit">Transmit</button>
-          </form>
+          <div class="command-footer">
+            <div class="macro-bar">
+              <button class="macro-btn bracket" id="macroSitrep">[⚡ Sitrep]</button>
+              <button class="macro-btn bracket" id="macroReboot">[🔄 Reboot System]</button>
+              <button class="macro-btn bracket" id="macroClearLogs">[🧹 Clear Logs]</button>
+              <button class="macro-btn bracket" id="macroOpenVault">[📁 Open Vault]</button>
+            </div>
+            <form id="chatForm" class="chat-form">
+              <input id="chatInput" type="text" placeholder="Launch a mission: ask for intel, code fixes, reports, or automation..." autocomplete="off" />
+              <button type="submit">Deploy</button>
+            </form>
+          </div>
         </section>
 
         <section id="tab-foundry" class="tab-view">
@@ -75,13 +124,40 @@
               <tbody id="truthRows"></tbody>
             </table>
           </div>
+          <div id="collectionBin" class="collection-bin hidden">
+            <div class="collection-title">Collection Bin</div>
+            <div id="collectionMeta" class="collection-meta">Waiting for completed output...</div>
+            <div class="collection-actions">
+              <button id="openOutputFolderBtn" class="macro-btn">📂 Open Output Folder</button>
+              <button id="downloadZipBtn" class="macro-btn">⬇️ Download Zip</button>
+              <button id="exportAuditBtn" class="macro-btn">📊 Export Audit CSV</button>
+            </div>
+          </div>
         </section>
 
         <section id="tab-cortex" class="tab-view">
           <div class="panel-card">
-            <h2>Cortex</h2>
-            <p>Memory and context visualization endpoint is reserved for this stage.</p>
-            <p class="muted">UI scaffold active. Backend APIs remain unchanged.</p>
+            <h2>Artifact Gallery</h2>
+            <div class="gallery-filters">
+              <button class="macro-btn gallery-filter active" data-kind="all">All</button>
+              <button class="macro-btn gallery-filter" data-kind="images">Images</button>
+              <button class="macro-btn gallery-filter" data-kind="documents">Documents</button>
+              <button class="macro-btn gallery-filter" data-kind="code">Code</button>
+            </div>
+            <div id="artifactGrid" class="artifact-grid"></div>
+          </div>
+        </section>
+
+        <section id="tab-strategy" class="tab-view">
+          <div class="strategy-grid">
+            <div class="panel-card">
+              <h2>Active Goals</h2>
+              <div id="strategyGoals" class="strategy-goals"></div>
+            </div>
+            <div class="panel-card">
+              <h2>Live Plan</h2>
+              <div id="strategyPlans" class="strategy-plans"></div>
+            </div>
           </div>
         </section>
 
@@ -89,6 +165,25 @@
           <div class="panel-card">
             <h2>Systems</h2>
             <div id="metrics" class="metrics-grid"></div>
+            <div class="system-settings">
+              <h3>Desktop Hooks</h3>
+              <label class="left-resource-row">
+                <span>Monitor Clipboard</span>
+                <input id="toggleClipboardMonitor" type="checkbox" />
+              </label>
+              <label class="left-resource-row">
+                <span>Timeline Mode</span>
+                <input id="toggleTimelineMode" type="checkbox" />
+              </label>
+            </div>
+            <div class="panel-card workflow-builder-card">
+              <h3>Workflow Builder</h3>
+              <div id="workflowBuilder" class="workflow-builder"></div>
+            </div>
+            <div class="resource-board hidden">
+              <h3>Resource Allocation</h3>
+              <div id="resourceRows" class="resource-rows"></div>
+            </div>
           </div>
         </section>
       </div>
@@ -96,32 +191,66 @@
 
     <aside id="watchtower" class="watchtower">
       <div class="watchtower-head">
-        <h2>Agent Watchtower</h2>
+        <h2>Command & Mission</h2>
+        <button class="toggle-btn mini-btn" title="More">⋮</button>
         <button id="toggleWatchtower" class="toggle-btn" title="Collapse">❯</button>
       </div>
       <div class="watchtower-body">
-        <div class="status-card">
-          <div class="card-title">Chief of Staff</div>
-          <div class="card-value online">Online / Listening</div>
+        <div class="gateway-card">
+          <div class="card-title">Filter Gateway</div>
+          <div id="gatewayState" class="gateway-pill allow">ALLOW</div>
+        </div>
+        <div class="pyramid-wrap">
+          <svg class="chain-svg" viewBox="0 0 260 360" preserveAspectRatio="none">
+            <line id="line-chief-planner" x1="130" y1="56" x2="130" y2="126"></line>
+            <line id="line-chief-dev" x1="130" y1="56" x2="45" y2="212"></line>
+            <line id="line-chief-research" x1="130" y1="56" x2="105" y2="212"></line>
+            <line id="line-chief-data" x1="130" y1="56" x2="160" y2="212"></line>
+            <line id="line-chief-script" x1="130" y1="56" x2="215" y2="212"></line>
+            <line id="line-chief-academic" x1="130" y1="56" x2="130" y2="298"></line>
+            <line id="line-planner-dev" x1="130" y1="126" x2="45" y2="212"></line>
+            <line id="line-planner-research" x1="130" y1="126" x2="105" y2="212"></line>
+            <line id="line-planner-data" x1="130" y1="126" x2="160" y2="212"></line>
+            <line id="line-planner-script" x1="130" y1="126" x2="215" y2="212"></line>
+          </svg>
+          <button id="node-chief" class="agent-node chief" data-agent="Chief_of_Staff" style="left: 92px; top: 20px;">👑 Chief</button>
+          <button id="node-planner" class="agent-node planner" data-agent="Planner_Agent" style="left: 84px; top: 96px;">🧭 Planner</button>
+          <button id="node-dev" class="agent-node specialist" data-agent="Dev_Agent" style="left: 8px; top: 188px;">👁 Dev</button>
+          <button id="node-research" class="agent-node specialist" data-agent="Research_Agent" style="left: 64px; top: 188px;">🔎 Research</button>
+          <button id="node-data" class="agent-node specialist" data-agent="Data_Scientist" style="left: 130px; top: 188px;">📊 Data</button>
+          <button id="node-script" class="agent-node specialist" data-agent="Script_Agent" style="left: 192px; top: 188px;">✍ Script</button>
+          <button id="node-academic" class="agent-node specialist" data-agent="Academic_Writer" style="left: 77px; top: 274px;">📚 Academic</button>
         </div>
         <div class="status-card">
-          <div class="card-title">Dev_Agent</div>
-          <div id="devAgentStatus" class="card-value idle">Idle</div>
+          <div class="card-title">Workflow Trace</div>
+          <div id="commandTrace" class="trace-text">Chief_of_Staff awaiting task routing.</div>
+        </div>
+        <div class="status-card">
+          <div class="card-title">Mission Control</div>
+          <div id="missionBoard" class="mission-board"></div>
         </div>
         <div class="status-card">
           <div class="card-title">System Health</div>
+          <div class="wave-wrap">
+            <span class="wave-label">Chief Voice Feed</span>
+            <span class="wave-bars"><i></i><i></i><i></i><i></i></span>
+          </div>
           <div id="healthBars" class="health-bars"></div>
         </div>
       </div>
     </aside>
   </div>
 
-  <section id="auditorConsole" class="auditor-console">
+  <section id="auditorConsole" class="auditor-console hidden collapsed">
     <div class="auditor-head">
       <h2>Auditor Console</h2>
       <button id="toggleAuditor" class="toggle-btn" title="Minimize">⌄</button>
     </div>
     <div class="auditor-grid">
+      <div class="terminal-block">
+        <div class="term-title">Timeline</div>
+        <div id="timelineList" class="terminal-list"></div>
+      </div>
       <div class="terminal-block">
         <div class="term-title">Recent Tasks</div>
         <div id="tasksList" class="terminal-list"></div>
@@ -132,6 +261,7 @@
       </div>
     </div>
   </section>
+  <div class="corner-star">✦</div>
 
   <div id="rowModal" class="modal">
     <div class="modal-body">
@@ -143,6 +273,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260212f"></script>
 </body>
 </html>

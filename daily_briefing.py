@@ -133,7 +133,12 @@ def enqueue_briefing():
 
 def main():
     queue.register_handler("daily_briefing", run_briefing_job)
-    queue.start_worker()
+    # Prevent this scheduler process from competing for unrelated queue tasks.
+    run_worker = os.getenv("DAILY_BRIEFING_RUN_WORKER", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if run_worker:
+        queue.start_worker()
+    else:
+        logger.info("Daily briefing queue worker disabled (set DAILY_BRIEFING_RUN_WORKER=true to enable)")
 
     schedule.every().day.at(os.getenv("DAILY_BRIEFING_TIME", "08:00")).do(enqueue_briefing)
 

@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# SQLite databases
+memory_store/*.db
+*.db-journal
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Virtual env
+victor_os_env/
+venv/
+.venv/
+
+# PyInstaller
+*.spec
+nul
