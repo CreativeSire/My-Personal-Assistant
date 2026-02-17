@@ -1569,6 +1569,7 @@ def _enqueue_via_control_api(
 ) -> str | None:
     base_url = os.getenv("VICTOR_TASK_API_URL", "http://127.0.0.1:8787").rstrip("/")
     url = f"{base_url}/v1/tasks"
+    api_key = str(os.getenv("VICTOR_API_KEY", "")).strip()
     payload = {
         "intent": f"enqueue invoice job for {os.path.basename(input_path)}",
         "channel": channel,
@@ -1582,10 +1583,13 @@ def _enqueue_via_control_api(
         },
     }
     request_data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["X-API-Key"] = api_key
     req = urllib.request.Request(
         url,
         data=request_data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
