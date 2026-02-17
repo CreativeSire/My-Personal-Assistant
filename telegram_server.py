@@ -458,6 +458,78 @@ def handle_policy(message):
         ),
     )
 
+
+@bot.message_handler(commands=["task"])
+def handle_task_command(message):
+    """
+    Usage:
+    /task status <task_id>
+    /task artifacts <task_id>
+    """
+    parts = str(message.text or "").strip().split()
+    if len(parts) < 3:
+        bot.reply_to(message, "Usage:\n/task status <task_id>\n/task artifacts <task_id>")
+        return
+    sub = parts[1].strip().lower()
+    task_id = parts[2].strip()
+    if sub == "status":
+        send_smart_message(message.chat.id, _render_task_status(task_id), reply_to_id=message)
+        return
+    if sub == "artifacts":
+        send_smart_message(message.chat.id, _render_task_artifacts(task_id), reply_to_id=message)
+        return
+    bot.reply_to(message, "Unknown /task command. Use `status` or `artifacts`.")
+
+
+@bot.message_handler(commands=["tasks"])
+def handle_tasks_command(message):
+    """
+    Usage:
+    /tasks latest
+    /tasks latest 10
+    """
+    parts = str(message.text or "").strip().split()
+    sub = parts[1].strip().lower() if len(parts) > 1 else "latest"
+    if sub != "latest":
+        bot.reply_to(message, "Usage: /tasks latest [count]")
+        return
+    count = 5
+    if len(parts) > 2:
+        try:
+            count = max(1, min(20, int(parts[2])))
+        except Exception:
+            count = 5
+    tasks = _query_recent_tasks(limit=count)
+    if not tasks:
+        bot.reply_to(message, "No tasks found.")
+        return
+    lines = [f"Latest {len(tasks)} Tasks:"]
+    for idx, t in enumerate(tasks, start=1):
+        lines.append(
+            f"{idx}. {t.get('id')} | {t.get('task_type')} | {t.get('status')} | "
+            f"progress={t.get('progress')} | retries={t.get('retries')}"
+        )
+    send_smart_message(message.chat.id, "\n".join(lines), reply_to_id=message)
+
+
+@bot.message_handler(commands=["queue_drill"])
+def handle_queue_drill(message):
+    try:
+        report = _task_queue.run_crash_recovery_drill()
+        send_smart_message(
+            message.chat.id,
+            (
+                "Crash-Recovery Drill:\n"
+                f"ok={report.get('ok')}\n"
+                f"task_id={report.get('task_id')}\n"
+                f"recovered_count={report.get('recovered_count')}\n"
+                f"post_status={report.get('post_status')}"
+            ),
+            reply_to_id=message,
+        )
+    except Exception as exc:
+        bot.reply_to(message, f"Queue drill failed: {exc}")
+
 # --- SAFETY VALVE (Auto-Splitter) ---
 def send_smart_message(chat_id, text, reply_to_id=None):
     """Splits messages longer than 4000 chars and sends them in parts."""
@@ -499,6 +571,70 @@ def _query_recent_tasks(limit: int = 5) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def _query_task_by_id(task_id: str) -> dict[str, Any] | None:
+    db_path = os.path.join(BASE_DIR, "memory_store", "victor_tasks.db")
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT id, task_type, status, channel, user_id, progress, retries, error, result, created_at, updated_at, completed_at
+            FROM tasks
+            WHERE id=?
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _extract_artifact_path_from_result(result_text: str) -> str | None:
+    raw_file, _ = _extract_send_file_marker(result_text or "")
+    if not raw_file:
+        return None
+    return _resolve_runtime_path(raw_file)
+
+
+def _render_task_status(task_id: str) -> str:
+    row = _query_task_by_id(task_id)
+    if not row:
+        return f"Task not found: {task_id}"
+    lines = [
+        f"Task Status: {row.get('id')}",
+        f"type={row.get('task_type')} | status={row.get('status')} | progress={row.get('progress')} | retries={row.get('retries')}",
+    ]
+    if row.get("error"):
+        lines.append(f"error={row.get('error')}")
+    artifact_path = _extract_artifact_path_from_result(str(row.get("result") or ""))
+    if artifact_path:
+        lines.append(f"artifact={artifact_path}")
+    return "\n".join(lines)
+
+
+def _render_task_artifacts(task_id: str) -> str:
+    row = _query_task_by_id(task_id)
+    if not row:
+        return f"Task not found: {task_id}"
+    artifact_path = _extract_artifact_path_from_result(str(row.get("result") or ""))
+    if not artifact_path:
+        return (
+            f"No artifact marker for task {task_id}.\n"
+            f"status={row.get('status')} | progress={row.get('progress')} | error={row.get('error') or 'none'}"
+        )
+    exists = os.path.exists(artifact_path)
+    size_mb = (os.path.getsize(artifact_path) / (1024 * 1024)) if exists else 0.0
+    return (
+        f"Task Artifacts: {task_id}\n"
+        f"path={artifact_path}\n"
+        f"exists={exists}\n"
+        f"size_mb={size_mb:.2f}"
+    )
 
 
 def _render_live_system_status(task_limit: int = 5) -> str:

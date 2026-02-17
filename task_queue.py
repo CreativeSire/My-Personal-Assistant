@@ -221,7 +221,12 @@ class TaskQueue:
         if self._notify_callback and message:
             task = self.get_task(task_id)
             if task:
-                self._notify_callback(task.user_id, task.channel, f"[Task {task_id[:8]}] {message} ({progress}%)")
+                self._notify_deduped(
+                    user_id=task.user_id,
+                    channel=task.channel,
+                    dedupe_key=f"{task_id}:progress:{int(progress)}",
+                    message=f"[Task {task_id[:8]}] {message} ({progress}%)",
+                )
 
     def _complete_task(self, task_id: str, result: str) -> None:
         now = time.time()
@@ -423,3 +428,67 @@ class TaskQueue:
             return True
         finally:
             conn.close()
+
+    def list_recent_tasks(self, limit: int = 5) -> list[Task]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [self._row_to_task(r) for r in rows]
+        finally:
+            conn.close()
+
+    def run_crash_recovery_drill(self, stale_seconds: float = 900.0) -> dict[str, Any]:
+        """
+        Drill:
+        1) Insert synthetic stale running task.
+        2) Trigger stale-task recovery.
+        3) Verify synthetic task returns to pending.
+        """
+        now = time.time()
+        task_id = f"drill_{uuid.uuid4().hex[:12]}"
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO tasks(
+                    id, task_type, payload, status, channel, user_id,
+                    created_at, updated_at, started_at, retries, max_retries,
+                    progress, priority, metadata, lease_expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    "drill_recovery",
+                    json.dumps({"drill": "crash_recovery"}),
+                    TaskStatus.RUNNING,
+                    "system",
+                    "drill_runner",
+                    now - (stale_seconds + 120),
+                    now - (stale_seconds + 120),
+                    now - (stale_seconds + 120),
+                    0,
+                    1,
+                    10,
+                    9,
+                    json.dumps({"drill": True}),
+                    now - 60,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        recovered_count = self.recover_stale_tasks(stale_seconds=stale_seconds)
+        post = self.get_task(task_id)
+        passed = bool(post and post.status == TaskStatus.PENDING)
+        return {
+            "ok": passed,
+            "task_id": task_id,
+            "recovered_count": recovered_count,
+            "post_status": post.status.value if post else "missing",
+            "checked_at": time.time(),
+        }
