@@ -54,3 +54,5 @@ workspace/*.png
 workspace/*.csv
 workspace/*.xlsx
 workspace/desktop_state/*.csv
+memory_store/training_exports/
+memory_store/training_exports_acceptance/

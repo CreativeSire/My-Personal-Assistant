@@ -246,3 +246,23 @@ class TrainingPipeline:
             with open(registry_path, "w", encoding="utf-8") as f:
                 json.dump(registry, f, indent=2)
         return {"ok": True, "promotion": result}
+
+    def compare_shadow_vs_active_metrics(
+        self,
+        *,
+        active_metrics: dict[str, Any],
+        shadow_metrics: dict[str, Any],
+        min_shadow_accuracy: float = 0.75,
+    ) -> dict[str, Any]:
+        active_acc = float(active_metrics.get("accuracy", 0.0))
+        shadow_acc = float(shadow_metrics.get("accuracy", 0.0))
+        delta = shadow_acc - active_acc
+        promotion_allowed = shadow_acc >= float(min_shadow_accuracy) and delta >= 0.0
+        return {
+            "active_accuracy": active_acc,
+            "shadow_accuracy": shadow_acc,
+            "delta_accuracy": delta,
+            "min_shadow_accuracy": float(min_shadow_accuracy),
+            "promotion_allowed": promotion_allowed,
+            "evaluated_at": time.time(),
+        }
