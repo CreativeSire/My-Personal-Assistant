@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Victor Labeling</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260212f">
+  <style>
+    .page-wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .card { background: rgba(18, 18, 22, 0.86); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 14px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    textarea, input, select { width: 100%; background: rgba(0,0,0,0.35); color: #e8e8ea; border: 1px solid rgba(255,255,255,0.10); border-radius: 10px; padding: 10px; }
+    textarea { min-height: 90px; resize: vertical; }
+    .btn { cursor: pointer; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #f2f2f3; padding: 10px 12px; border-radius: 12px; }
+    .btn.primary { background: rgba(90, 210, 140, 0.18); border-color: rgba(90, 210, 140, 0.30); }
+    .btns { display: flex; gap: 10px; flex-wrap: wrap; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="page-wrap">
+    <div class="btns" style="margin-bottom: 14px;">
+      <a class="btn" href="/">Back</a>
+      <a class="btn" href="/planner">Planner</a>
+      <button class="btn" id="btnExport">Export Dataset (Phase 3)</button>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2 style="margin-top:0;">Record Feedback (Training Signal)</h2>
+        <label>Reason Code</label>
+        <select id="reason">
+          <option value="hallucination">hallucination</option>
+          <option value="tone_mismatch">tone_mismatch</option>
+          <option value="wrong_tool">wrong_tool</option>
+          <option value="unsafe_action">unsafe_action</option>
+          <option value="other" selected>other</option>
+        </select>
+        <div style="height:10px;"></div>
+        <label>Rejected Output (what Victor said/did wrong)</label>
+        <textarea id="rejected" class="mono"></textarea>
+        <div style="height:10px;"></div>
+        <label>Preferred Output (what you wanted instead)</label>
+        <textarea id="preferred" class="mono"></textarea>
+        <div style="height:10px;"></div>
+        <div class="btns">
+          <button class="btn primary" id="btnSubmit">Submit Feedback</button>
+        </div>
+        <div id="status" style="margin-top:10px; opacity: 0.9;"></div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top:0;">Last Response</h2>
+        <pre id="out" class="mono">{}</pre>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (t) => { $("status").textContent = t || ""; };
+  const setOut = (obj) => { $("out").textContent = JSON.stringify(obj ?? {}, null, 2); };
+
+  async function postJson(url, payload) {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload ?? {}) });
+    return { status: res.status, body: await res.json() };
+  }
+
+  $("btnSubmit").addEventListener("click", async () => {
+    const reason_code = $("reason").value;
+    const rejected_output = $("rejected").value || "";
+    const preferred_output = $("preferred").value || "";
+    if (!rejected_output.trim() && !preferred_output.trim()) {
+      setStatus("Add at least rejected or preferred output.");
+      return;
+    }
+    setStatus("Submitting feedback...");
+    const r = await postJson("/api/control/feedback", {
+      reason_code,
+      rejected_output,
+      preferred_output,
+      source: "desktop_labeling",
+    });
+    setStatus(`Feedback HTTP ${r.status}`);
+    setOut(r.body);
+  });
+
+  $("btnExport").addEventListener("click", async () => {
+    setStatus("Exporting dataset...");
+    const out_dir = "victor_os/memory_store/training_exports_ui";
+    const r = await postJson("/api/control/training/export", { out_dir, eval_ratio: 0.2 });
+    setStatus(`Export HTTP ${r.status}`);
+    setOut(r.body);
+  });
+</script>
+</body>
+</html>
+

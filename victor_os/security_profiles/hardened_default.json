@@ -1,0 +1,20 @@
+{
+  "name": "hardened_default",
+  "version": "1.0.0",
+  "description": "Default hardened security posture for Victor runtime.",
+  "env": {
+    "APP_ENV": "prod",
+    "VICTOR_POLICY_HARD_DENY_ENABLED": "true",
+    "VICTOR_API_RATE_LIMIT_PER_MIN": "90",
+    "VICTOR_API_RATE_LIMIT_TASKS_WRITE_PER_MIN": "45",
+    "VICTOR_API_RATE_LIMIT_CONTROL_WRITE_PER_MIN": "15",
+    "VICTOR_API_RATE_LIMIT_TRAINING_WRITE_PER_MIN": "20",
+    "VICTOR_API_RATE_LIMIT_AUDIT_READ_PER_MIN": "60",
+    "PROACTIVE_ENABLED": "true",
+    "PROACTIVE_TELEGRAM_ENABLED": "true",
+    "PROACTIVE_EMAIL_ENABLED": "false",
+    "DAILY_BRIEFING_BOOT_RUN": "true",
+    "TASK_RETRY_BASE_DELAY_SEC": "5",
+    "TASK_RETRY_MAX_DELAY_SEC": "120"
+  }
+}

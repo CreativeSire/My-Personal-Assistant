@@ -1,0 +1,29 @@
+{
+  "name": "self_training_nightly",
+  "description": "Nightly self-improvement loop: export data and notify",
+  "trigger": "schedule:02:00",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "check_readiness",
+      "action": "training_status",
+      "params": {},
+      "retries": 0
+    },
+    {
+      "name": "export_dataset",
+      "action": "trigger_training_export",
+      "params": {},
+      "retries": 1
+    },
+    {
+      "name": "notify_completion",
+      "action": "notify",
+      "params": {
+        "message": "$ctx.step_export_dataset_result"
+      },
+      "retries": 0
+    }
+  ]
+}
+

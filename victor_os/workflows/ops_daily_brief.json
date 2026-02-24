@@ -1,0 +1,37 @@
+{
+  "name": "ops_daily_brief",
+  "description": "Generate and deliver a daily ops status summary.",
+  "trigger": "schedule:08:00",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "collect_ops_health",
+      "action": "ops_health_summary",
+      "params": {},
+      "retries": 1
+    },
+    {
+      "name": "get_calendar",
+      "action": "todays_agenda",
+      "params": {},
+      "retries": 1
+    },
+    {
+      "name": "format_report",
+      "action": "compose_daily_ops_report",
+      "params": {
+        "health": "$ctx.step_collect_ops_health_result",
+        "calendar": "$ctx.step_get_calendar_result"
+      },
+      "retries": 0
+    },
+    {
+      "name": "notify_user",
+      "action": "notify",
+      "params": {
+        "message": "$ctx.step_format_report_result"
+      },
+      "retries": 1
+    }
+  ]
+}

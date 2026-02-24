@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Victor Planner</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260212f">
+  <style>
+    .page-wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { background: rgba(18, 18, 22, 0.86); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 14px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    textarea, input { width: 100%; background: rgba(0,0,0,0.35); color: #e8e8ea; border: 1px solid rgba(255,255,255,0.10); border-radius: 10px; padding: 10px; }
+    textarea { min-height: 120px; resize: vertical; }
+    .btn { cursor: pointer; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #f2f2f3; padding: 10px 12px; border-radius: 12px; }
+    .btn.primary { background: rgba(90, 210, 140, 0.18); border-color: rgba(90, 210, 140, 0.30); }
+    .btns { display: flex; gap: 10px; flex-wrap: wrap; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+    @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="page-wrap">
+    <div class="btns" style="margin-bottom: 14px;">
+      <a class="btn" href="/">Back</a>
+      <a class="btn" href="/labeling">Labeling</a>
+      <button class="btn" id="btnHealth">Control API Health</button>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h2 style="margin-top: 0;">Planner</h2>
+        <label>Intent</label>
+        <input id="intent" placeholder="e.g. Draft a WhatsApp message to Jane about tomorrow's meeting" />
+        <div style="height: 10px;"></div>
+        <label>Context (JSON)</label>
+        <textarea id="context" class="mono">{}</textarea>
+        <div style="height: 10px;"></div>
+        <div class="btns">
+          <button class="btn primary" id="btnRun">Plan + Execute</button>
+          <button class="btn" id="btnLatest">Latest Tasks</button>
+        </div>
+        <div id="status" style="margin-top: 10px; opacity: 0.9;"></div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top: 0;">Result</h2>
+        <pre id="out" class="mono">{}</pre>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (t) => { $("status").textContent = t || ""; };
+  const setOut = (obj) => { $("out").textContent = JSON.stringify(obj ?? {}, null, 2); };
+
+  async function postJson(url, payload) {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload ?? {}) });
+    return { status: res.status, body: await res.json() };
+  }
+  async function getJson(url) {
+    const res = await fetch(url);
+    return { status: res.status, body: await res.json() };
+  }
+
+  $("btnHealth").addEventListener("click", async () => {
+    setStatus("Checking control API...");
+    const r = await getJson("/api/control/health");
+    setStatus(`Health HTTP ${r.status}`);
+    setOut(r.body);
+  });
+
+  $("btnLatest").addEventListener("click", async () => {
+    setStatus("Fetching latest tasks...");
+    const r = await getJson("/api/control/tasks/latest?limit=10");
+    setStatus(`Latest HTTP ${r.status}`);
+    setOut(r.body);
+  });
+
+  $("btnRun").addEventListener("click", async () => {
+    let ctx = {};
+    try {
+      ctx = JSON.parse($("context").value || "{}");
+    } catch (e) {
+      setStatus("Context JSON is invalid.");
+      return;
+    }
+    const intent = $("intent").value || "";
+    if (!intent.trim()) {
+      setStatus("Intent is required.");
+      return;
+    }
+    setStatus("Running orchestrator...");
+    const r = await postJson("/api/control/orchestrate/run", { intent, context: ctx });
+    setStatus(`Run HTTP ${r.status}`);
+    setOut(r.body);
+  });
+</script>
+</body>
+</html>
+

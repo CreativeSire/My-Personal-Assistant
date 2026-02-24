@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Victor Skill Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "version",
+    "description",
+    "triggers",
+    "required_env",
+    "config_schema",
+    "risk_profile",
+    "permissions_required",
+    "tools_exposed"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "triggers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_env": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "config_schema": {
+      "type": "object"
+    },
+    "risk_profile": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "permissions_required": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tools_exposed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

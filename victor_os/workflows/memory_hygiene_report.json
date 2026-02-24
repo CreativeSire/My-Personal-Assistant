@@ -1,0 +1,22 @@
+{
+  "name": "memory_hygiene_report",
+  "description": "Run a memory hygiene audit and send recommendations.",
+  "trigger": "schedule:sunday:03:00",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "name": "audit_memory",
+      "action": "memory_hygiene",
+      "params": {},
+      "retries": 1
+    },
+    {
+      "name": "notify_user",
+      "action": "notify",
+      "params": {
+        "message": "$ctx.step_audit_memory_result"
+      },
+      "retries": 1
+    }
+  ]
+}

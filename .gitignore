@@ -1,0 +1,18 @@
+# Victor OS Gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+victor_os_env/
+.vscode/
+.idea/
+*.log
+*.sqlite
+*.db
+memory_store/
+data/
+archive/
+nul
+~$*

@@ -1,0 +1,62 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# SQLite databases
+memory_store/*.db
+*.db-journal
+relay_service/*.db
+
+# Logs
+logs/
+*.log
+boot_log.txt
+server_debug.txt
+server_debug_stream.txt
+tg_stdout.log
+tg_stderr.log
+desktop_out.log
+desktop_err.log
+data/system_logs.csv
+data/victor_os.log.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Virtual env
+victor_os_env/
+venv/
+.venv/
+
+# PyInstaller
+*.spec
+nul
+
+# Runtime/work artifacts
+workspace/jobs/
+workspace/desktop_uploads/
+workspace/*.zip
+workspace/*.png
+workspace/*.csv
+workspace/*.xlsx
+workspace/desktop_state/*.csv
+memory_store/training_exports/
+memory_store/training_exports_acceptance/
+memory_store/training_exports_phase3_cert/
+memory_store/backups/
+memory_store/checkpoints/

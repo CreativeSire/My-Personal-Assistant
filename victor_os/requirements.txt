@@ -1,0 +1,35 @@
+# Victor-OS optional dependencies for Phase upgrades
+#
+# NOTE: This repo currently runs on Windows/Python 3.14 in your environment.
+# Some packages may not have wheels for all Python versions. Install selectively.
+
+# Track 1 — Self-training (learned intent router)
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Track 2 — Market Watch (stocks)
+yfinance>=0.2.0
+
+# Track 3 — Voice Input (local STT)
+openai-whisper>=20231117
+
+# Track 3 — Calendar
+google-api-python-client>=2.0.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.0.0
+
+# Track 3 — File Watcher
+watchdog>=4.0.0
+
+# Track 4 — Voice Interface (wake word)
+pvporcupine>=3.0.0
+pyaudio>=0.2.14
+
+# Track 4 — Browser Agent
+playwright>=1.40.0
+
+# Track 4 — Self-coder (optional)
+anthropic>=0.40.0
+
+# Optional — Copilot SDK bridge
+github-copilot-sdk>=0.1.0

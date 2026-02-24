@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell:*)",
+      "Bash(git rm:*)",
+      "Bash(find:*)",
+      "Bash(python:*)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "Bash(start \"VictorTelegram\" /B cmd /c \"cd victor_os && python telegram_server.py > ..\\\\telegram_server.log 2>&1\")",
+      "Bash(Start-Process python -ArgumentList \"telegram_server.py\" -WorkingDirectory \"c:\\\\Users\\\\HomePC\\\\Desktop\\\\My Personal Assistant\\\\victor_os\" -RedirectStandardOutput \"c:\\\\Users\\\\HomePC\\\\Desktop\\\\My Personal Assistant\\\\telegram_server.log\" -RedirectStandardError \"c:\\\\Users\\\\HomePC\\\\Desktop\\\\My Personal Assistant\\\\telegram_server_err.log\" -WindowStyle Hidden)",
+      "Bash(Start-Sleep 5)",
+      "Bash(Get-Content \"c:\\\\Users\\\\HomePC\\\\Desktop\\\\My Personal Assistant\\\\telegram_server.log\" -Tail 15)"
+    ]
+  }
+}
