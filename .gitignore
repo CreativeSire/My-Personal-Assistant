@@ -1,18 +1,57 @@
-# Victor OS Gitignore
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*secret*
+*credential*
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-.env
-venv/
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
 victor_os_env/
+venv/
+env/
+.venv/
+
+# ── Databases & memory (too large / sensitive for git) ────────────────────────
+victor_os/memory_store/*.db
+victor_os/memory_store/victor_brain_vectors/
+victor_os/data/*.csv
+victor_os/data/*.json
+victor_os/data/*.log
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+*.log.*
+logs/
+docs/reports/
+
+# ── OS & editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
 .vscode/
 .idea/
-*.log
-*.sqlite
-*.db
-memory_store/
-data/
-archive/
-nul
-~$*
+*.swp
+*.swo
+
+# ── Test / cache ─────────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+*.coverage
+htmlcov/
+platform/test_app.py
+platform/check_deps.py
+
+# ── Node (if any frontend is added later) ────────────────────────────────────
+node_modules/

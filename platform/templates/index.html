@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Victor OS — Neural Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <style>
+    :root {
+      --bg:        #080c14;
+      --surface:   #0f1623;
+      --card:      #141e2e;
+      --border:    rgba(99,120,180,0.18);
+      --accent:    #6366f1;
+      --accent2:   #a78bfa;
+      --green:     #34d399;
+      --blue:      #60a5fa;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --danger:    #f87171;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;font-size:14px;overflow-x:hidden}
+    ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:var(--bg)} ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+    /* ── LAYOUT ── */
+    .shell{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+    @media(max-width:768px){.shell{grid-template-columns:1fr}.sidebar{display:none}.topbar{display:flex}}
+
+    /* ── SIDEBAR ── */
+    .sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:24px 16px;position:sticky;top:0;height:100vh;overflow-y:auto}
+    .logo{display:flex;align-items:center;gap:10px;margin-bottom:32px}
+    .logo-icon{width:36px;height:36px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px}
+    .logo-text{font-weight:700;font-size:16px;letter-spacing:-0.3px}
+    .logo-ver{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase}
+    nav{flex:1}
+    .nav-group{margin-bottom:24px}
+    .nav-label{font-size:10px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);padding:0 8px;margin-bottom:8px}
+    .nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;cursor:pointer;transition:all .2s;color:var(--muted);font-weight:500;border:none;background:none;width:100%;text-align:left;font-size:13.5px}
+    .nav-item:hover{background:rgba(99,102,241,0.1);color:var(--text)}
+    .nav-item.active{background:rgba(99,102,241,0.15);color:var(--accent2);border-left:2px solid var(--accent)}
+    .nav-item .icon{font-size:16px;width:20px;text-align:center}
+    .status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite;margin-left:auto;flex-shrink:0}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    .sidebar-footer{border-top:1px solid var(--border);padding-top:16px;margin-top:8px}
+    .user-card{display:flex;align-items:center;gap:10px;padding:8px}
+    .avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--green));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0}
+    .user-name{font-weight:600;font-size:13px}
+    .user-role{font-size:11px;color:var(--muted)}
+
+    /* ── TOPBAR (mobile) ── */
+    .topbar{display:none;align-items:center;justify-content:space-between;padding:16px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+    .hamburger{background:none;border:none;color:var(--text);font-size:20px;cursor:pointer}
+
+    /* ── MAIN ── */
+    .main{display:flex;flex-direction:column;overflow:hidden}
+    .content{flex:1;padding:28px;overflow-y:auto}
+
+    /* ── HEADER ── */
+    .page-header{margin-bottom:28px}
+    .page-title{font-size:24px;font-weight:700;letter-spacing:-0.5px;background:linear-gradient(135deg,var(--text),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+    .page-sub{color:var(--muted);font-size:13px;margin-top:4px}
+
+    /* ── TABS ── */
+    .tabs{display:flex;gap:4px;background:var(--surface);padding:4px;border-radius:12px;margin-bottom:28px;width:fit-content;border:1px solid var(--border)}
+    .tab{padding:8px 20px;border-radius:9px;cursor:pointer;font-weight:500;font-size:13px;color:var(--muted);transition:all .2s;border:none;background:none}
+    .tab.active{background:var(--card);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.4)}
+    @media(max-width:480px){.tabs{width:100%}.tab{flex:1;text-align:center}}
+
+    /* ── PANELS ── */
+    .panel{display:none}
+    .panel.active{display:block}
+
+    /* ── STAT CARDS ── */
+    .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+    @media(max-width:900px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:480px){.stats-grid{grid-template-columns:1fr 1fr}}
+    .stat-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;position:relative;overflow:hidden;transition:transform .2s}
+    .stat-card:hover{transform:translateY(-2px)}
+    .stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+    .stat-card.cpu::before{background:linear-gradient(90deg,#f59e0b,#ef4444)}
+    .stat-card.ram::before{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+    .stat-card.disk::before{background:linear-gradient(90deg,var(--blue),var(--green))}
+    .stat-card.mem::before{background:linear-gradient(90deg,var(--green),#10b981)}
+    .stat-label{font-size:11px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+    .stat-value{font-size:28px;font-weight:700;letter-spacing:-1px}
+    .stat-sub{font-size:11px;color:var(--muted);margin-top:4px}
+
+    /* ── AGENT CARDS ── */
+    .agents-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}
+    @media(max-width:700px){.agents-row{grid-template-columns:1fr}}
+    .agent-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;display:flex;align-items:center;gap:14px}
+    .agent-orb{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+    .agent-name{font-weight:600;font-size:14px}
+    .agent-role{font-size:11px;color:var(--muted);margin-top:2px}
+    .agent-badge{margin-top:6px;display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 8px;border-radius:99px}
+    .badge-ready{background:rgba(52,211,153,.12);color:var(--green)}
+    .badge-busy{background:rgba(251,191,36,.12);color:#fbbf24}
+
+    /* ── BUILD PANEL ── */
+    .build-box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px}
+    .input-group{display:flex;gap:12px;margin-bottom:20px}
+    @media(max-width:600px){.input-group{flex-direction:column}}
+    .idea-input{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px;color:var(--text);font-family:'Inter',sans-serif;font-size:14px;outline:none;transition:border-color .2s}
+    .idea-input:focus{border-color:var(--accent)}
+    .idea-input::placeholder{color:var(--muted)}
+    .btn-build{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:10px;padding:14px 28px;font-weight:600;font-size:14px;cursor:pointer;white-space:nowrap;transition:opacity .2s}
+    .btn-build:hover{opacity:.9}
+    .btn-build:disabled{opacity:.5;cursor:not-allowed}
+    .output-terminal{background:#050810;border:1px solid var(--border);border-radius:12px;padding:20px;min-height:320px;max-height:520px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.7}
+    .output-terminal .line{margin-bottom:2px;animation:fadein .3s ease}
+    @keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+    .line-info{color:#a78bfa}
+    .line-chunk{color:#cbd5e1;white-space:pre-wrap;word-break:break-word}
+    .line-done{color:var(--green);font-weight:600}
+    .line-error{color:var(--danger)}
+    .cursor{display:inline-block;width:8px;height:14px;background:var(--accent2);animation:blink 1s infinite;vertical-align:middle}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+    .status-bar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface);border-radius:8px;margin-bottom:16px;font-size:12px;color:var(--muted)}
+    .status-indicator{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
+    .status-indicator.busy{background:#fbbf24;box-shadow:0 0 8px #fbbf24;animation:pulse 1s infinite}
+
+    /* ── MEMORY PANEL ── */
+    .memory-list{display:flex;flex-direction:column;gap:10px}
+    .memory-item{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;transition:transform .2s}
+    .memory-item:hover{transform:translateX(4px)}
+    .memory-tag{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;padding:2px 8px;border-radius:99px;background:rgba(99,102,241,.15);color:var(--accent2);margin-bottom:8px}
+    .memory-text{font-size:13px;color:var(--text);line-height:1.5}
+    .memory-time{font-size:11px;color:var(--muted);margin-top:6px}
+
+    /* ── GLASS CARD ── */
+    .glass{background:rgba(20,30,46,0.7);backdrop-filter:blur(12px);border:1px solid var(--border);border-radius:16px}
+
+    /* ── EMPTY STATE ── */
+    .empty{text-align:center;padding:60px 20px;color:var(--muted)}
+    .empty-icon{font-size:40px;margin-bottom:12px}
+
+    /* ── TOAST ── */
+    #toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--green);color:var(--text);padding:12px 20px;border-radius:10px;font-size:13px;transform:translateY(100px);opacity:0;transition:all .3s;z-index:999;max-width:300px}
+    #toast.show{transform:translateY(0);opacity:1}
+  </style>
+</head>
+<body>
+
+<div class="shell">
+  <!-- ── SIDEBAR ── -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-icon">⚡</div>
+      <div>
+        <div class="logo-text">Victor OS</div>
+        <div class="logo-ver">Platform v3.0</div>
+      </div>
+    </div>
+
+    <nav>
+      <div class="nav-group">
+        <div class="nav-label">Main</div>
+        <button class="nav-item active" onclick="switchTab('overview', this)">
+          <span class="icon">🏠</span> Overview
+          <span class="status-dot"></span>
+        </button>
+        <button class="nav-item" onclick="switchTab('build', this)">
+          <span class="icon">⚙️</span> Build Engine
+        </button>
+        <button class="nav-item" onclick="switchTab('memory', this)">
+          <span class="icon">🧠</span> Memory Store
+        </button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">Integrations</div>
+        <button class="nav-item" onclick="showToast('Telegram connected ✅')">
+          <span class="icon">✈️</span> Telegram
+          <span class="status-dot"></span>
+        </button>
+        <button class="nav-item" onclick="showToast('WhatsApp — configure in .env')">
+          <span class="icon">💬</span> WhatsApp
+        </button>
+      </div>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="user-card">
+        <div class="avatar">V</div>
+        <div>
+          <div class="user-name">Victor</div>
+          <div class="user-role">Platform Owner</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── MAIN ── -->
+  <main class="main">
+    <!-- Mobile topbar -->
+    <div class="topbar">
+      <div class="logo">
+        <div class="logo-icon" style="width:28px;height:28px;font-size:14px">⚡</div>
+        <div class="logo-text">Victor OS</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button class="nav-item" style="padding:6px 10px" onclick="switchTab('build',null)">⚙️</button>
+        <button class="nav-item" style="padding:6px 10px" onclick="switchTab('memory',null)">🧠</button>
+      </div>
+    </div>
+
+    <div class="content">
+      <!-- TABS -->
+      <div class="tabs">
+        <button class="tab active" id="tab-overview"  onclick="switchTab('overview',null)">Overview</button>
+        <button class="tab"        id="tab-build"     onclick="switchTab('build',null)">⚙️ Build</button>
+        <button class="tab"        id="tab-memory"    onclick="switchTab('memory',null)">🧠 Memory</button>
+      </div>
+
+      <!-- ── OVERVIEW PANEL ── -->
+      <div class="panel active" id="panel-overview">
+        <div class="page-header">
+          <div class="page-title">Neural Command Centre</div>
+          <div class="page-sub" id="uptime-label">Loading system status…</div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card cpu">
+            <div class="stat-label">CPU Load</div>
+            <div class="stat-value" id="cpu-val">—</div>
+            <div class="stat-sub">Processing power</div>
+          </div>
+          <div class="stat-card ram">
+            <div class="stat-label">Memory</div>
+            <div class="stat-value" id="ram-val">—</div>
+            <div class="stat-sub">RAM utilisation</div>
+          </div>
+          <div class="stat-card disk">
+            <div class="stat-label">Disk</div>
+            <div class="stat-value" id="disk-val">—</div>
+            <div class="stat-sub">Storage health</div>
+          </div>
+          <div class="stat-card mem">
+            <div class="stat-label">Memories</div>
+            <div class="stat-value" id="mem-count">—</div>
+            <div class="stat-sub">Stored records</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px;font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">AI Agents</div>
+        <div class="agents-row" id="agents-row">
+          <div class="agent-card">
+            <div class="agent-orb" style="background:rgba(167,139,250,.15)">🏛️</div>
+            <div>
+              <div class="agent-name">Claude Sonnet 4.6</div>
+              <div class="agent-role">Lead Architect</div>
+              <span class="agent-badge badge-ready">● Ready</span>
+            </div>
+          </div>
+          <div class="agent-card">
+            <div class="agent-orb" style="background:rgba(52,211,153,.15)">🎨</div>
+            <div>
+              <div class="agent-name">Gemini 3.1 Pro</div>
+              <div class="agent-role">UX Researcher</div>
+              <span class="agent-badge badge-ready">● Ready</span>
+            </div>
+          </div>
+          <div class="agent-card">
+            <div class="agent-orb" style="background:rgba(96,165,250,.15)">💻</div>
+            <div>
+              <div class="agent-name">GPT-4o</div>
+              <div class="agent-role">Senior Developer</div>
+              <span class="agent-badge badge-ready">● Ready</span>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px;font-size:12px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Last Build Preview</div>
+        <div class="glass" style="padding:20px" id="last-build-preview">
+          <div class="empty"><div class="empty-icon">📄</div><div>No builds yet. Go to Build Engine to create something.</div></div>
+        </div>
+      </div>
+
+      <!-- ── BUILD PANEL ── -->
+      <div class="panel" id="panel-build">
+        <div class="page-header">
+          <div class="page-title">Build Engine</div>
+          <div class="page-sub">Claude architects · Gemini designs · GPT-4o codes</div>
+        </div>
+
+        <div class="build-box">
+          <div class="input-group">
+            <input id="idea-input" class="idea-input"
+              placeholder="Describe what you want to build… e.g. WhatsApp CRM for DALA"
+              onkeydown="if(event.key==='Enter')startBuild()"/>
+            <button class="btn-build" id="build-btn" onclick="startBuild()">🚀 Launch Crew</button>
+          </div>
+
+          <div class="status-bar">
+            <div class="status-indicator" id="build-indicator"></div>
+            <span id="build-status-text">Crew standing by</span>
+          </div>
+
+          <div class="output-terminal" id="output-terminal">
+            <div class="line line-info">// Victor Platform Build Engine v3.0</div>
+            <div class="line line-info">// Type your idea above and press Launch Crew.</div>
+            <div class="line line-info">// Three frontier models will collaborate in real time.</div>
+            <div class="line">&nbsp;</div>
+            <span class="cursor"></span>
+          </div>
+        </div>
+
+        <div style="margin-top:20px;padding:16px;background:var(--card);border-radius:12px;border:1px solid var(--border)">
+          <div style="font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">Quick Launch Ideas</div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px" id="quick-ideas">
+          </div>
+        </div>
+      </div>
+
+      <!-- ── MEMORY PANEL ── -->
+      <div class="panel" id="panel-memory">
+        <div class="page-header">
+          <div class="page-title">Memory Store</div>
+          <div class="page-sub">Victor OS long-term knowledge base</div>
+        </div>
+        <div class="memory-list" id="memory-list">
+          <div class="empty"><div class="empty-icon">🔍</div><div>Loading memories…</div></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── STATE ─────────────────────────────────────────────────────────────────────
+let building = false;
+
+// ── TAB SWITCHING ─────────────────────────────────────────────────────────────
+function switchTab(name, btn) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  const tabEl = document.getElementById('tab-' + name);
+  if (tabEl) tabEl.classList.add('active');
+  if (btn) btn.classList.add('active');
+  if (name === 'memory') loadMemory();
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────────
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── STATUS POLLING ────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  try {
+    const data = await fetch('/api/status').then(r => r.json());
+    document.getElementById('cpu-val').textContent  = data.cpu + '%';
+    document.getElementById('ram-val').textContent  = data.ram + '%';
+    document.getElementById('disk-val').textContent = data.disk + '%';
+    document.getElementById('mem-count').textContent = data.memory_records;
+    document.getElementById('uptime-label').textContent = 'System Online · ' + data.uptime;
+    if (data.last_build_preview && data.last_build_preview.length > 10) {
+      document.getElementById('last-build-preview').innerHTML =
+        '<div style="font-family:\'JetBrains Mono\',monospace;font-size:12px;color:#cbd5e1;white-space:pre-wrap;line-height:1.6">'
+        + escHtml(data.last_build_preview) + '</div>';
+    }
+  } catch(e) {}
+}
+
+// ── BUILD ENGINE ──────────────────────────────────────────────────────────────
+function startBuild() {
+  if (building) return;
+  const idea = document.getElementById('idea-input').value.trim();
+  if (!idea) { showToast('Please enter an idea first!'); return; }
+
+  building = true;
+  const btn  = document.getElementById('build-btn');
+  const term = document.getElementById('output-terminal');
+  const ind  = document.getElementById('build-indicator');
+  const st   = document.getElementById('build-status-text');
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Building…';
+  ind.classList.add('busy');
+  st.textContent = 'Crew is working — Claude · Gemini · GPT-4o';
+  term.innerHTML = '';
+
+  addLine(term, '// 🚀 Launching crew for: ' + escHtml(idea), 'line-info');
+  addLine(term, '// ' + new Date().toLocaleTimeString(), 'line-info');
+  addLine(term, '', '');
+
+  const evtSrc = new EventSource('/api/build?idea=' + encodeURIComponent(idea));
+  let fullText = '';
+
+  evtSrc.onmessage = (e) => {
+    const d = e.data;
+    if (d === 'STARTED' || d === 'COMPLETE') return;
+    if (d === 'DONE') {
+      addLine(term, '', '');
+      addLine(term, '✅ Build complete! Output saved to memory store.', 'line-done');
+      finishBuild(btn, ind, st, evtSrc);
+      refreshStatus();
+      return;
+    }
+    if (d.startsWith('ERROR:')) {
+      addLine(term, '❌ ' + d.slice(6), 'line-error');
+      finishBuild(btn, ind, st, evtSrc);
+      return;
+    }
+    if (d.startsWith('CHUNK:')) {
+      fullText += d.slice(6).replace(/\\n/g, '\n');
+      renderChunks(term, fullText);
+      return;
+    }
+    // Status messages
+    addLine(term, d, 'line-info');
+    term.scrollTop = term.scrollHeight;
+  };
+  evtSrc.onerror = () => {
+    addLine(term, '⚠️ Stream interrupted', 'line-error');
+    finishBuild(btn, ind, st, evtSrc);
+  };
+}
+
+function finishBuild(btn, ind, st, evtSrc) {
+  building = false;
+  btn.disabled = false;
+  btn.textContent = '🚀 Launch Crew';
+  ind.classList.remove('busy');
+  st.textContent = 'Crew standing by';
+  evtSrc.close();
+}
+
+function renderChunks(term, text) {
+  // Re-render output section cleanly
+  let existing = term.querySelector('.full-output');
+  if (!existing) {
+    existing = document.createElement('div');
+    existing.className = 'full-output line line-chunk';
+    term.appendChild(existing);
+  }
+  existing.textContent = text;
+  term.scrollTop = term.scrollHeight;
+}
+
+function addLine(term, text, cls) {
+  const d = document.createElement('div');
+  d.className = 'line ' + cls;
+  d.textContent = text;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── MEMORY ────────────────────────────────────────────────────────────────────
+async function loadMemory() {
+  const list = document.getElementById('memory-list');
+  list.innerHTML = '<div class="empty"><div class="empty-icon">⏳</div><div>Loading…</div></div>';
+  try {
+    const data = await fetch('/api/memory?limit=30').then(r => r.json());
+    if (!data.memories || data.memories.length === 0) {
+      list.innerHTML = '<div class="empty"><div class="empty-icon">🧠</div><div>No memories found yet.</div></div>';
+      return;
+    }
+    list.innerHTML = data.memories.map(m => `
+      <div class="memory-item">
+        <span class="memory-tag">${escHtml(m.type || 'memory')}</span>
+        <div class="memory-text">${escHtml(m.text)}</div>
+        <div class="memory-time">${m.created_at || ''}</div>
+      </div>`).join('');
+  } catch(e) {
+    list.innerHTML = '<div class="empty"><div class="empty-icon">⚠️</div><div>Could not load memories.</div></div>';
+  }
+}
+
+// ── QUICK IDEAS ───────────────────────────────────────────────────────────────
+const quickIdeas = [
+  "WhatsApp CRM for DALA",
+  "AI SPSS replacement dashboard",
+  "Crypto portfolio tracker",
+  "Invoice automation system",
+  "React analytics dashboard",
+];
+window.addEventListener('DOMContentLoaded', () => {
+  const el = document.getElementById('quick-ideas');
+  quickIdeas.forEach(idea => {
+    const btn = document.createElement('button');
+    btn.className = 'nav-item';
+    btn.style = 'width:auto;padding:8px 14px;border-radius:99px;border:1px solid var(--border);font-size:12px';
+    btn.textContent = idea;
+    btn.onclick = () => {
+      document.getElementById('idea-input').value = idea;
+      switchTab('build', null);
+    };
+    el.appendChild(btn);
+  });
+  refreshStatus();
+  setInterval(refreshStatus, 15000);
+});
+</script>
+</body>
+</html>
